@@ -1,135 +1,147 @@
 # kube-symbiont
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+> **Status: experimental.** The phantom-pod mechanism below is a homelab capstone
+> experiment, not a production pattern. Validate its scheduling behaviour on a
+> non-critical node before trusting it; the standard Kubernetes controls
+> (`kubeReserved`, `systemReserved`, Node Allocatable, eviction thresholds) come first.
 
-## Getting Started
+A Kubernetes operator that makes **bare-metal resource usage visible to the scheduler**.
+Processes running alongside a cluster outside Kubernetes — game servers under Pterodactyl/Wings,
+Docker daemons, systemd services — contribute **zero** to the scheduler's capacity math,
+which silently over-commits nodes. kube-symbiont maintains one "phantom pod" per bare-metal
+workload whose resource *requests* mirror that workload's measured CPU/RAM, so the scheduler
+accounts for capacity it cannot otherwise see.
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+## Why this exists: requests vs usage
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+`allocatable` is static arithmetic computed once at kubelet startup:
 
-```sh
-make docker-build docker-push IMG=<some-registry>/kube-symbiont:tag
+```
+allocatable = capacity − kube-reserved − system-reserved − hard-eviction-threshold
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+Nothing in that formula measures live usage. Placement is ledger arithmetic —
+`allocatable − Σ(requests of pods already scheduled)` — and a bare-metal process is not a
+Pod, so it sums as zero. The kernel *does* see the bare-metal process, but only reactively
+(eviction manager / OOM killer), i.e. after the node is already starving. The failure mode:
+the scheduler keeps packing pods because the ledger looks fine, then eviction fires.
 
-**Install the CRDs into the cluster:**
+kube-symbiont is the dynamic, per-workload version of `system-reserved`: it measures the
+real footprint via Prometheus and injects it into the ledger as phantom-pod requests.
 
-```sh
-make install
-```
+## How the phantom works
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+A `pause` container with `requests: 8Gi` occupies ~1 MB of real RAM. The kernel sees ~1 MB;
+the scheduler sees 8 GiB subtracted from allocatable when placing *other* pods. That asymmetry
+is the entire mechanism. Each phantom is:
 
-```sh
-make deploy IMG=<some-registry>/kube-symbiont:tag
-```
+| Property | Value |
+|---|---|
+| Image | `registry.k8s.io/pause:3.9` |
+| Placement | hard pin via `spec.nodeName` (bare metal cannot migrate anyway) |
+| QoS | Guaranteed — requests == limits, patched together (QoS class is immutable) |
+| Resize policy | `NotRequired` for cpu **and** memory → in-place resize, no restart |
+| PriorityClass | `symbiont-ballast` (value 1000) so priority-0 workloads cannot preempt it |
+| Lifetime | controller ownerReference → deleting the ShadowWorkload GCs the phantom |
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+Reconcile loop per ShadowWorkload: ensure phantom exists → resolve source to PromQL →
+instant-query Prometheus over the window → clamp to `[floor, ceiling]` → if relative drift
+exceeds `deltaThresholdPercent`, PATCH the pod **resize subresource** (requests and limits
+together) → update status → `RequeueAfter: pollInterval`. Metric-driven, so it re-measures
+on a clock regardless of CR changes.
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+Requires **Kubernetes 1.29+** (In-Place Pod Vertical Scaling; GA and default-on at 1.35).
 
-```sh
-kubectl apply -k config/samples/
-```
+## Measured sources (v1alpha1)
 
->**NOTE**: Ensure that the samples has default values to test it out.
+Exactly one source per ShadowWorkload; each resolves to a CPU-cores + memory-bytes pair.
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+- **`docker`** — shadows Docker containers running directly on the host, discriminated from
+  k8s pods by cgroup **id prefix**: `id=~"/system.slice/docker-.*"` on the standalone
+  cAdvisor job. (Image-label matching was refuted by measurement: cAdvisor monitors the whole
+  cgroup tree and k8s pod series carry `image` labels too.)
+- **`promql`** — raw CPU/memory query passthrough; escape hatch for anything else.
+- *(v0.2 planned: `cgroup` path globs and `systemd` unit sources.)*
 
-```sh
-kubectl delete -k config/samples/
-```
+## Quickstart
 
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
+Prerequisites: Go 1.24+, kubectl, kustomize (Makefile fetches tools locally), and a cluster
+running Kubernetes ≥ 1.29 with Prometheus already scraping cAdvisor.
 
 ```sh
-make build-installer IMG=<some-registry>/kube-symbiont:tag
+# 1. Install namespace + symbiont-ballast PriorityClass + CRDs + operator.
+#    IMG must be pullable from the cluster.
+make deploy IMG=<registry>/kube-symbiont:v0.1.0
+
+# 2. Point one ShadowWorkload at your bare-metal host.
+kubectl apply -f config/samples/symbiont_v1alpha1_shadowworkload.yaml
+
+# 3. Watch the phantom track reality.
+kubectl get shadowworkloads -o wide     # or: kubectl get sw
 ```
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
+### Example
 
-2. Using the installer
+```yaml
+apiVersion: symbiont.tensorhost.com/v1alpha1
+kind: ShadowWorkload
+metadata:
+  name: lab-docker
+spec:
+  node: lab                      # phantom pinned here via spec.nodeName
+  source:
+    type: docker                 # id-prefix selector generated for you
+    docker:
+      selector: all              # every bare-metal container on the node
+      cadvisorJob: cadvisor      # standalone cAdvisor's Prometheus job label
+      cadvisorInstance: "192.0.2.10:4194"   # optional scoping
+  metrics:
+    prometheusURL: http://kube-prometheus-stack-prometheus.monitoring:9090
+    window: 5m                   # moving-average smoothing horizon
+  update:
+    deltaThresholdPercent: 10    # resize only when drift exceeds this
+    pollInterval: 30s            # measure → clamp → resize cadence
+    floor:   { cpu: 10m, memory: 32Mi }    # workload off / no metrics
+    ceiling: { cpu: "8", memory: 32Gi }    # safety clamps
+```
 
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
+Raw-query alternative:
+
+```yaml
+source:
+  type: promql
+  promql:
+    cpuCores: 'sum(rate(container_cpu_usage_seconds_total{id=~"/system.slice/docker-.*"}[5m]))'
+    memoryBytes: 'sum(avg_over_time(container_memory_working_set_bytes{id=~"/system.slice/docker-.*"}[5m]))'
+```
+
+Behaviour on rough edges: workload off or emitting nothing → phantom settles on the floor;
+brief spikes → absorbed by the moving average; phantom deleted externally → recreated;
+in-place resize rejected → phantom keeps previous requests and the CR reports a `Degraded`
+condition; controller restart → resumes from the phantom's current requests.
+
+## Development
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/kube-symbiont/<tag or branch>/dist/install.yaml
+make test          # unit + envtest suite (envtest binaries fetched automatically)
+make run           # run the manager against your current kubeconfig context
+make manifests generate   # regenerate CRDs/RBAC/deepcopy after API edits
 ```
 
-### By providing a Helm Chart
+## Known limitations
 
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+- **Experimental mechanism.** Phantom reservations influence placement but protect nothing
+  at the kernel level: under extreme pressure the OOM killer reads actual pages, not requests.
+  This complements — never replaces — properly configured `kubeReserved`/`systemReserved`.
+- **Scheduler race during resize.** A brief window exists where the node can be
+  over-scheduled mid-resize (acknowledged upstream). Low risk at homelab scale.
+- **Polling delay.** Between a spike and the phantom's resize there is up to one
+  `pollInterval` plus window smoothing of lag, by design.
+- **Prometheus dependency.** Measurement quality equals scrape coverage; a dead Prometheus
+  freezes the phantom at its last size rather than shrinking it.
+- **Single-node targeting.** Each ShadowWorkload pins one node; multi-host bare metal means
+  one resource per host.
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Apache-2.0. Copyright 2026.
