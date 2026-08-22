@@ -1,0 +1,43 @@
+# Dogfood reference from "Resource Shadow Controller" (2026-08-21 baseline study):
+# shadow ALL bare-metal Docker containers on node `lab` via the standalone
+# cAdvisor job, using cgroup id-prefix selectors (image-label matching is
+# refuted — k8s pod series carry image labels too).
+#
+# Requires: kube-symbiont namespace + symbiont-ballast PriorityClass
+# (`kubectl apply -k config/symbiont`) and the operator running.
+apiVersion: symbiont.tensorhost.com/v1alpha1
+kind: ShadowWorkload
+metadata:
+  name: lab-docker
+spec:
+  # Phantom pod is pinned here via spec.nodeName; its requests are subtracted
+  # from this node's allocatable in the scheduler ledger.
+  node: lab
+
+  source:
+    type: docker
+    docker:
+      selector: all            # every bare-metal Docker container on the node
+      cadvisorJob: cadvisor    # Prometheus job label of standalone cAdvisor
+      cadvisorInstance: 192.0.2.10:4194   # scope to this node's series
+
+  metrics:
+    prometheusURL: http://kube-prometheus-stack-prometheus.monitoring:9090
+    window: 5m                 # smoothing horizon for generated queries
+
+  update:
+    deltaThresholdPercent: 10  # resize only when drift exceeds this
+    pollInterval: 30s          # measure → clamp → resize cadence
+    floor:                     # when workload is off / emits no metrics
+      cpu: 10m
+      memory: 32Mi
+    ceiling:                   # safety clamps
+      cpu: "8"
+      memory: 32Gi
+
+# Raw-query alternative (escape hatch):
+#  source:
+#    type: promql
+#    promql:
+#      cpuCores: 'sum(rate(container_cpu_usage_seconds_total{id=~"/system.slice/docker-.*"}[5m]))'
+#      memoryBytes: 'sum(avg_over_time(container_memory_working_set_bytes{id=~"/system.slice/docker-.*"}[5m]))'
