@@ -1,0 +1,327 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	symbiontv1alpha1 "github.com/michaelwetyyy/kube-symbiont/api/v1alpha1"
+	"github.com/michaelwetyyy/kube-symbiont/internal/shadow"
+	"github.com/michaelwetyyy/kube-symbiont/internal/sources"
+)
+
+const (
+	conditionReady    = "Ready"
+	conditionDegraded = "Degraded"
+
+	reasonMetricsSynced         = "MetricsSynced"
+	reasonWithinThreshold       = "WithinThreshold"
+	reasonPhantomCreated        = "PhantomCreated"
+	reasonPhantomRecreated      = "PhantomRecreated"
+	reasonResized               = "Resized"
+	reasonNodeMissing           = "NodeMissing"
+	reasonSourceInvalid         = "SourceInvalid"
+	reasonPrometheusUnavailable = "PrometheusUnavailable"
+	reasonResizeRejected        = "ResizeRejected"
+	reasonPhantomConflict       = "PhantomConflict"
+	reasonAsExpected            = "AsExpected"
+
+	defaultPollInterval = 30 * time.Second
+	queryTimeout        = 10 * time.Second
+)
+
+// MetricsQuerier issues resolved query pairs against a metrics backend.
+type MetricsQuerier interface {
+	QueryPair(ctx context.Context, q sources.Queries) (cpuCores, memoryBytes float64, found bool, err error)
+}
+
+// ShadowWorkloadReconciler reconciles a ShadowWorkload object: it measures the
+// declared bare-metal workload and keeps a phantom ballast pod's requests
+// mirroring that footprint on the scheduler ledger.
+type ShadowWorkloadReconciler struct {
+	client.Client
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
+
+	// QuerierFor builds a metrics querier for a Prometheus URL. Defaults to
+	// sources.NewClient; overridable for tests.
+	QuerierFor func(rawURL string) (MetricsQuerier, error)
+}
+
+// +kubebuilder:rbac:groups=symbiont.tensorhost.com,resources=shadowworkloads,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=symbiont.tensorhost.com,resources=shadowworkloads/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=pods/resize,verbs=patch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
+
+// Reconcile runs the measure → clamp → resize loop:
+//
+//  1. validate the target node exists (nodes get),
+//  2. resolve spec.source into a PromQL pair and measure it,
+//  3. clamp the measurement to [floor, ceiling],
+//  4. ensure the phantom pod exists (create if missing, recreate if its node
+//     pin no longer matches), pinned via spec.nodeName with Guaranteed QoS,
+//  5. when relative drift exceeds deltaThresholdPercent, PATCH the pod resize
+//     subresource — requests AND limits together, preserving Guaranteed QoS,
+//  6. update status and requeue after pollInterval (metric-driven loop).
+func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var sw symbiontv1alpha1.ShadowWorkload
+	if err := r.Get(ctx, req.NamespacedName, &sw); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	log := logf.FromContext(ctx).WithValues("shadowWorkload", req.NamespacedName, "node", sw.Spec.Node)
+
+	statusBase := sw.DeepCopy()
+	poll := pollInterval(&sw)
+
+	degradedReason := ""
+	degradedMsg := ""
+	readyReason := reasonWithinThreshold
+	phantomObserved := false
+
+	setReady := func(reason string) { readyReason = reason }
+	setDegraded := func(reason, format string, args ...any) {
+		if degradedReason == "" { // first failure wins
+			degradedReason = reason
+			degradedMsg = fmt.Sprintf(format, args...)
+		}
+	}
+
+	// Node gate: the phantom is pinned via nodeName; scheduling onto a
+	// nonexistent node would strand it Pending forever.
+	nodeMissing := false
+	var node corev1.Node
+	if err := r.Get(ctx, client.ObjectKey{Name: sw.Spec.Node}, &node); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("get target node %q: %w", sw.Spec.Node, err)
+		}
+		nodeMissing = true
+		setDegraded(reasonNodeMissing, "target node %q does not exist", sw.Spec.Node)
+		r.Recorder.Eventf(&sw, corev1.EventTypeWarning, reasonNodeMissing, "Target node %q does not exist", sw.Spec.Node)
+	}
+
+	measuredCPU, measuredMem := 0.0, 0.0
+	if !nodeMissing {
+		r.measure(ctx, &sw, log, setDegraded, &measuredCPU, &measuredMem)
+	}
+
+	floor := sw.Spec.Update.Floor
+	ceiling := sw.Spec.Update.Ceiling
+	desired := shadow.Clamp(shadow.PairOf(measuredCPU, measuredMem), floor, ceiling)
+
+	// Ensure the phantom exists and matches the current node pin.
+	name := shadow.PhantomName(sw.Name)
+	key := client.ObjectKey{Namespace: sw.Namespace, Name: name}
+	var pod corev1.Pod
+	err := r.Get(ctx, key, &pod)
+	switch {
+	case apierrors.IsNotFound(err):
+		fresh, berr := shadow.BuildPhantomPod(&sw, r.Scheme, desired)
+		if berr != nil {
+			return ctrl.Result{}, fmt.Errorf("build phantom pod: %w", berr)
+		}
+		if cerr := r.Create(ctx, fresh); cerr != nil {
+			return ctrl.Result{}, fmt.Errorf("create phantom pod %s: %w", name, cerr)
+		}
+		log.Info("Created phantom Pod", "pod", name, "node", sw.Spec.Node,
+			"cpu", desired.CPU.String(), "memory", desired.Memory.String())
+		r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonPhantomCreated,
+			"Created phantom Pod %s on node %q (cpu=%s memory=%s)", name, sw.Spec.Node, desired.CPU.String(), desired.Memory.String())
+		pod = *fresh
+		phantomObserved = true
+		setReady(reasonPhantomCreated)
+	case err != nil:
+		return ctrl.Result{}, fmt.Errorf("get phantom pod %s: %w", name, err)
+	case pod.Spec.NodeName != sw.Spec.Node:
+		// Target node changed: the pin must follow. Delete and recreate next pass.
+		if derr := r.Delete(ctx, &pod); derr != nil && !apierrors.IsNotFound(derr) {
+			return ctrl.Result{}, fmt.Errorf("delete stale phantom pod %s: %w", name, derr)
+		}
+		log.Info("Deleted phantom Pod for node re-pin", "pod", name, "oldNode", pod.Spec.NodeName, "newNode", sw.Spec.Node)
+		r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonPhantomRecreated,
+			"Deleted phantom Pod %s; re-pinning from node %q to %q", name, pod.Spec.NodeName, sw.Spec.Node)
+		setReady(reasonPhantomRecreated)
+	case !ownedBySw(&pod, &sw):
+		setDegraded(reasonPhantomConflict,
+			"pod %s exists but is not owned by this ShadowWorkload; refusing to manage it", name)
+		r.Recorder.Eventf(&sw, corev1.EventTypeWarning, reasonPhantomConflict,
+			"Pod %s already exists without controller ownerRef to this ShadowWorkload", name)
+	default:
+		phantomObserved = true
+		current := shadow.CurrentPairOf(&pod)
+		if degradedReason == "" && shadow.DriftExceeds(current, desired, sw.Spec.Update.DeltaThresholdPercent) {
+			before := current
+			if rerr := r.resizePhantom(ctx, &pod, desired); rerr != nil {
+				setDegraded(reasonResizeRejected, "in-place resize of %s rejected: %v", name, rerr)
+				log.Error(rerr, "In-place resize rejected", "pod", name)
+				r.Recorder.Eventf(&sw, corev1.EventTypeWarning, reasonResizeRejected,
+					"In-place resize of Pod %s rejected (%s -> cpu=%s memory=%s); keeping previous requests",
+					name, rerr, desired.CPU.String(), desired.Memory.String())
+			} else {
+				log.Info("Resized phantom Pod", "pod", name,
+					"cpu", before.CPU.String()+"->"+desired.CPU.String(),
+					"memory", before.Memory.String()+"->"+desired.Memory.String())
+				r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonResized,
+					"Resized Pod %s: cpu %s -> %s, memory %s -> %s",
+					name, before.CPU.String(), desired.CPU.String(), before.Memory.String(), desired.Memory.String())
+				now := metav1.Now()
+				sw.Status.LastResize = now
+				sw.Status.CurrentCPU = desired.CPU
+				sw.Status.CurrentMemory = desired.Memory
+				setReady(reasonResized)
+			}
+		} else if degradedReason == "" {
+			setReady(reasonWithinThreshold)
+		}
+	}
+
+	// Status currents are only refreshed when this pass actually observed or
+	// managed the phantom; during outages (node missing, Prometheus down,
+	// resize rejected, foreign-pod conflict) they keep reporting last truth.
+	// LastResize is stamped only by an accepted resize.
+	if phantomObserved {
+		sw.Status.PhantomPod = name
+		effective := shadow.CurrentPairOf(&pod)
+		sw.Status.CurrentCPU = effective.CPU
+		sw.Status.CurrentMemory = effective.Memory
+	}
+
+	if degradedReason != "" {
+		meta.SetStatusCondition(&sw.Status.Conditions, metav1.Condition{
+			Type: conditionReady, Status: metav1.ConditionFalse, Reason: degradedReason,
+			Message: degradedMsg,
+		})
+		meta.SetStatusCondition(&sw.Status.Conditions, metav1.Condition{
+			Type: conditionDegraded, Status: metav1.ConditionTrue, Reason: degradedReason,
+			Message: degradedMsg,
+		})
+	} else {
+		meta.SetStatusCondition(&sw.Status.Conditions, metav1.Condition{
+			Type: conditionReady, Status: metav1.ConditionTrue, Reason: readyReason,
+			Message: fmt.Sprintf("tracking node %q at cpu=%s memory=%s",
+				sw.Spec.Node, sw.Status.CurrentCPU.String(), sw.Status.CurrentMemory.String()),
+		})
+		meta.SetStatusCondition(&sw.Status.Conditions, metav1.Condition{
+			Type: conditionDegraded, Status: metav1.ConditionFalse, Reason: reasonAsExpected,
+			Message: "phantom tracking nominal",
+		})
+	}
+
+	if perr := r.Status().Patch(ctx, &sw, client.MergeFrom(statusBase)); perr != nil {
+		log.Error(perr, "Failed to patch ShadowWorkload status")
+	}
+
+	log.Info("Reconciled", "ready", degradedReason == "", "requeueAfter", poll.String())
+	return ctrl.Result{RequeueAfter: poll}, nil
+}
+
+// measure resolves the source to queries and fills in the measured pair.
+// Prometheus problems are soft failures: the phantom keeps its last requests
+// and the loop retries after pollInterval.
+func (r *ShadowWorkloadReconciler) measure(
+	ctx context.Context,
+	sw *symbiontv1alpha1.ShadowWorkload,
+	log logr.Logger,
+	setDegraded func(reason, format string, args ...any),
+	cpuOut, memOut *float64,
+) {
+	queries, err := sources.Resolve(&sw.Spec)
+	if err != nil {
+		setDegraded(reasonSourceInvalid, "%v", err)
+		return
+	}
+	querier, err := r.QuerierFor(sw.Spec.Metrics.PrometheusURL)
+	if err != nil {
+		setDegraded(reasonSourceInvalid, "metrics backend config: %v", err)
+		return
+	}
+	qctx, cancel := context.WithTimeout(ctx, queryTimeout+5*time.Second)
+	defer cancel()
+	cpu, mem, found, qerr := querier.QueryPair(qctx, queries)
+	if qerr != nil {
+		setDegraded(reasonPrometheusUnavailable, "%v", qerr)
+		log.Error(qerr, "Failed to query metrics backend", "prometheusURL", sw.Spec.Metrics.PrometheusURL)
+		r.Recorder.Eventf(sw, corev1.EventTypeWarning, reasonPrometheusUnavailable,
+			"Prometheus query failed: %v", qerr)
+		return
+	}
+	log.Info("Measured bare-metal footprint", "cpuCores", cpu, "memoryBytes", mem, "seriesFound", found)
+	*cpuOut, *memOut = cpu, mem
+}
+
+// resizePhantom patches the pod resize subresource. Requests and limits are
+// always written together: QoS class is immutable, so changing only one side
+// would be rejected (or worse, change QoS).
+func (r *ShadowWorkloadReconciler) resizePhantom(ctx context.Context, pod *corev1.Pod, desired symbiontv1alpha1.ResourcePair) error {
+	base := pod.DeepCopy()
+	resources := corev1.ResourceList{
+		corev1.ResourceCPU:    desired.CPU,
+		corev1.ResourceMemory: desired.Memory,
+	}
+	for i := range pod.Spec.Containers {
+		pod.Spec.Containers[i].Resources.Requests = resources.DeepCopy()
+		pod.Spec.Containers[i].Resources.Limits = resources.DeepCopy()
+	}
+	return r.SubResource("resize").Patch(ctx, pod, client.StrategicMergeFrom(base))
+}
+
+func ownedBySw(pod *corev1.Pod, sw *symbiontv1alpha1.ShadowWorkload) bool {
+	ref := metav1.GetControllerOf(pod)
+	return ref != nil && ref.UID == sw.UID &&
+		ref.Kind == "ShadowWorkload" && ref.APIVersion == symbiontv1alpha1.GroupVersion.String()
+}
+
+func pollInterval(sw *symbiontv1alpha1.ShadowWorkload) time.Duration {
+	d, err := time.ParseDuration(sw.Spec.Update.PollInterval)
+	if err != nil || d <= 0 {
+		return defaultPollInterval
+	}
+	return d
+}
+
+// SetupWithManager sets up the controller with the Manager. Owning phantom
+// pods means external deletion or modification triggers an immediate
+// reconcile; the poll clock keeps the metric-driven cadence regardless.
+func (r *ShadowWorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorderFor("kube-symbiont")
+	}
+	if r.QuerierFor == nil {
+		r.QuerierFor = func(rawURL string) (MetricsQuerier, error) {
+			return sources.NewClient(rawURL, queryTimeout)
+		}
+	}
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&symbiontv1alpha1.ShadowWorkload{}).
+		Owns(&corev1.Pod{}).
+		Named("shadowworkload").
+		Complete(r)
+}
