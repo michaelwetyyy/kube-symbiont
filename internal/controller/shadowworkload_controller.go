@@ -47,6 +47,8 @@ const (
 	reasonPhantomRecreated      = "PhantomRecreated"
 	reasonResized               = "Resized"
 	reasonNodeMissing           = "NodeMissing"
+	reasonNodeNotReady          = "NodeNotReady"
+	reasonNodeTerminating       = "NodeTerminating"
 	reasonSourceInvalid         = "SourceInvalid"
 	reasonPrometheusUnavailable = "PrometheusUnavailable"
 	reasonResizeRejected        = "ResizeRejected"
@@ -84,7 +86,9 @@ type ShadowWorkloadReconciler struct {
 
 // Reconcile runs the measure → clamp → resize loop:
 //
-//  1. validate the target node exists (nodes get),
+//  1. gate on target-node eligibility (nodes get): an absent, terminating
+//     or not-Ready node defers all phantom management — a nodeName-pinned
+//     pod created anyway could never run its containers,
 //  2. resolve spec.source into a PromQL pair and measure it,
 //  3. clamp the measurement to [floor, ceiling],
 //  4. ensure the phantom pod exists (create if missing, recreate if its node
@@ -107,6 +111,13 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	readyReason := reasonWithinThreshold
 	phantomObserved := false
 
+	// Phantom identity/effective requests observed by this pass; only read
+	// when phantomObserved is true (the eligible-management path).
+	var (
+		phantomPodName string
+		observedPod    *corev1.Pod
+	)
+
 	setReady := func(reason string) { readyReason = reason }
 	setDegraded := func(reason, format string, args ...any) {
 		if degradedReason == "" { // first failure wins
@@ -115,21 +126,34 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
-	// Node gate: the phantom is pinned via nodeName; scheduling onto a
-	// nonexistent node would strand it Pending forever.
-	nodeMissing := false
+	// Node gate: the phantom is pinned via nodeName and bypasses the
+	// scheduler entirely, so creating one against an absent, terminating or
+	// not-Ready node would strand it Pending forever. Until the node is
+	// live again, no phantom is created or resized; the loop retries on the
+	// poll clock and the phantom appears on the first eligible reconcile.
 	var node corev1.Node
-	if err := r.Get(ctx, client.ObjectKey{Name: sw.Spec.Node}, &node); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, fmt.Errorf("get target node %q: %w", sw.Spec.Node, err)
+	nodeErr := r.Get(ctx, client.ObjectKey{Name: sw.Spec.Node}, &node)
+	nodeEligible := false
+	switch {
+	case nodeErr == nil:
+		ok, why := shadow.NodeEligible(&node)
+		nodeEligible = ok
+		if !ok {
+			reason := nodeConditionReason(why)
+			msg := shadow.NodeEligibilityError(sw.Spec.Node, why)
+			setDegraded(reason, "%s", msg)
+			r.warnOnDegradedTransition(&sw, reason, msg)
 		}
-		nodeMissing = true
-		setDegraded(reasonNodeMissing, "target node %q does not exist", sw.Spec.Node)
-		r.Recorder.Eventf(&sw, corev1.EventTypeWarning, reasonNodeMissing, "Target node %q does not exist", sw.Spec.Node)
+	case apierrors.IsNotFound(nodeErr):
+		msg := shadow.NodeEligibilityError(sw.Spec.Node, shadow.NodeReasonMissing)
+		setDegraded(reasonNodeMissing, "%s", msg)
+		r.warnOnDegradedTransition(&sw, reasonNodeMissing, msg)
+	default:
+		return ctrl.Result{}, fmt.Errorf("get target node %q: %w", sw.Spec.Node, nodeErr)
 	}
 
 	measuredCPU, measuredMem := 0.0, 0.0
-	if !nodeMissing {
+	if nodeEligible {
 		r.measure(ctx, &sw, log, setDegraded, &measuredCPU, &measuredMem)
 	}
 
@@ -137,70 +161,76 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	ceiling := sw.Spec.Update.Ceiling
 	desired := shadow.Clamp(shadow.PairOf(measuredCPU, measuredMem), floor, ceiling)
 
-	// Ensure the phantom exists and matches the current node pin.
-	name := shadow.PhantomName(sw.Name)
-	key := client.ObjectKey{Namespace: sw.Namespace, Name: name}
-	var pod corev1.Pod
-	err := r.Get(ctx, key, &pod)
-	switch {
-	case apierrors.IsNotFound(err):
-		fresh, berr := shadow.BuildPhantomPod(&sw, r.Scheme, desired)
-		if berr != nil {
-			return ctrl.Result{}, fmt.Errorf("build phantom pod: %w", berr)
-		}
-		if cerr := r.Create(ctx, fresh); cerr != nil {
-			return ctrl.Result{}, fmt.Errorf("create phantom pod %s: %w", name, cerr)
-		}
-		log.Info("Created phantom Pod", "pod", name, "node", sw.Spec.Node,
-			"cpu", desired.CPU.String(), "memory", desired.Memory.String())
-		r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonPhantomCreated,
-			"Created phantom Pod %s on node %q (cpu=%s memory=%s)", name, sw.Spec.Node, desired.CPU.String(), desired.Memory.String())
-		pod = *fresh
-		phantomObserved = true
-		setReady(reasonPhantomCreated)
-	case err != nil:
-		return ctrl.Result{}, fmt.Errorf("get phantom pod %s: %w", name, err)
-	case pod.Spec.NodeName != sw.Spec.Node:
-		// Target node changed: the pin must follow. Delete and recreate next pass.
-		if derr := r.Delete(ctx, &pod); derr != nil && !apierrors.IsNotFound(derr) {
-			return ctrl.Result{}, fmt.Errorf("delete stale phantom pod %s: %w", name, derr)
-		}
-		log.Info("Deleted phantom Pod for node re-pin", "pod", name, "oldNode", pod.Spec.NodeName, "newNode", sw.Spec.Node)
-		r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonPhantomRecreated,
-			"Deleted phantom Pod %s; re-pinning from node %q to %q", name, pod.Spec.NodeName, sw.Spec.Node)
-		setReady(reasonPhantomRecreated)
-	case !ownedBySw(&pod, &sw):
-		setDegraded(reasonPhantomConflict,
-			"pod %s exists but is not owned by this ShadowWorkload; refusing to manage it", name)
-		r.Recorder.Eventf(&sw, corev1.EventTypeWarning, reasonPhantomConflict,
-			"Pod %s already exists without controller ownerRef to this ShadowWorkload", name)
-	default:
-		phantomObserved = true
-		current := shadow.CurrentPairOf(&pod)
-		if degradedReason == "" && shadow.DriftExceeds(current, desired, sw.Spec.Update.DeltaThresholdPercent) {
-			before := current
-			if rerr := r.resizePhantom(ctx, &pod, desired); rerr != nil {
-				setDegraded(reasonResizeRejected, "in-place resize of %s rejected: %v", name, rerr)
-				log.Error(rerr, "In-place resize rejected", "pod", name)
-				r.Recorder.Eventf(&sw, corev1.EventTypeWarning, reasonResizeRejected,
-					"In-place resize of Pod %s rejected (%s -> cpu=%s memory=%s); keeping previous requests",
-					name, rerr, desired.CPU.String(), desired.Memory.String())
-			} else {
-				log.Info("Resized phantom Pod", "pod", name,
-					"cpu", before.CPU.String()+"->"+desired.CPU.String(),
-					"memory", before.Memory.String()+"->"+desired.Memory.String())
-				r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonResized,
-					"Resized Pod %s: cpu %s -> %s, memory %s -> %s",
-					name, before.CPU.String(), desired.CPU.String(), before.Memory.String(), desired.Memory.String())
-				now := metav1.Now()
-				sw.Status.LastResize = now
-				sw.Status.CurrentCPU = desired.CPU
-				sw.Status.CurrentMemory = desired.Memory
-				setReady(reasonResized)
+	if nodeEligible {
+		// Ensure the phantom exists and matches the current node pin. Skipped
+		// entirely while the node is ineligible: no create, no resize, and any
+		// pre-existing phantom keeps reporting its last requests as last truth.
+		name := shadow.PhantomName(sw.Name)
+		key := client.ObjectKey{Namespace: sw.Namespace, Name: name}
+		var pod corev1.Pod
+		err := r.Get(ctx, key, &pod)
+		switch {
+		case apierrors.IsNotFound(err):
+			fresh, berr := shadow.BuildPhantomPod(&sw, r.Scheme, desired)
+			if berr != nil {
+				return ctrl.Result{}, fmt.Errorf("build phantom pod: %w", berr)
 			}
-		} else if degradedReason == "" {
-			setReady(reasonWithinThreshold)
+			if cerr := r.Create(ctx, fresh); cerr != nil {
+				return ctrl.Result{}, fmt.Errorf("create phantom pod %s: %w", name, cerr)
+			}
+			log.Info("Created phantom Pod", "pod", name, "node", sw.Spec.Node,
+				"cpu", desired.CPU.String(), "memory", desired.Memory.String())
+			r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonPhantomCreated,
+				"Created phantom Pod %s on node %q (cpu=%s memory=%s)", name, sw.Spec.Node, desired.CPU.String(), desired.Memory.String())
+			pod = *fresh
+			phantomObserved = true
+			setReady(reasonPhantomCreated)
+		case err != nil:
+			return ctrl.Result{}, fmt.Errorf("get phantom pod %s: %w", name, err)
+		case pod.Spec.NodeName != sw.Spec.Node:
+			// Target node changed: the pin must follow. Delete and recreate next pass.
+			if derr := r.Delete(ctx, &pod); derr != nil && !apierrors.IsNotFound(derr) {
+				return ctrl.Result{}, fmt.Errorf("delete stale phantom pod %s: %w", name, derr)
+			}
+			log.Info("Deleted phantom Pod for node re-pin", "pod", name, "oldNode", pod.Spec.NodeName, "newNode", sw.Spec.Node)
+			r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonPhantomRecreated,
+				"Deleted phantom Pod %s; re-pinning from node %q to %q", name, pod.Spec.NodeName, sw.Spec.Node)
+			setReady(reasonPhantomRecreated)
+		case !ownedBySw(&pod, &sw):
+			setDegraded(reasonPhantomConflict,
+				"pod %s exists but is not owned by this ShadowWorkload; refusing to manage it", name)
+			r.Recorder.Eventf(&sw, corev1.EventTypeWarning, reasonPhantomConflict,
+				"Pod %s already exists without controller ownerRef to this ShadowWorkload", name)
+		default:
+			phantomObserved = true
+			current := shadow.CurrentPairOf(&pod)
+			if degradedReason == "" && shadow.DriftExceeds(current, desired, sw.Spec.Update.DeltaThresholdPercent) {
+				before := current
+				if rerr := r.resizePhantom(ctx, &pod, desired); rerr != nil {
+					setDegraded(reasonResizeRejected, "in-place resize of %s rejected: %v", name, rerr)
+					log.Error(rerr, "In-place resize rejected", "pod", name)
+					r.Recorder.Eventf(&sw, corev1.EventTypeWarning, reasonResizeRejected,
+						"In-place resize of Pod %s rejected (%s -> cpu=%s memory=%s); keeping previous requests",
+						name, rerr, desired.CPU.String(), desired.Memory.String())
+				} else {
+					log.Info("Resized phantom Pod", "pod", name,
+						"cpu", before.CPU.String()+"->"+desired.CPU.String(),
+						"memory", before.Memory.String()+"->"+desired.Memory.String())
+					r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonResized,
+						"Resized Pod %s: cpu %s -> %s, memory %s -> %s",
+						name, before.CPU.String(), desired.CPU.String(), before.Memory.String(), desired.Memory.String())
+					now := metav1.Now()
+					sw.Status.LastResize = now
+					sw.Status.CurrentCPU = desired.CPU
+					sw.Status.CurrentMemory = desired.Memory
+					setReady(reasonResized)
+				}
+			} else if degradedReason == "" {
+				setReady(reasonWithinThreshold)
+			}
 		}
+		phantomPodName = name
+		observedPod = &pod
 	}
 
 	// Status currents are only refreshed when this pass actually observed or
@@ -208,8 +238,8 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// resize rejected, foreign-pod conflict) they keep reporting last truth.
 	// LastResize is stamped only by an accepted resize.
 	if phantomObserved {
-		sw.Status.PhantomPod = name
-		effective := shadow.CurrentPairOf(&pod)
+		sw.Status.PhantomPod = phantomPodName
+		effective := shadow.CurrentPairOf(observedPod)
 		sw.Status.CurrentCPU = effective.CPU
 		sw.Status.CurrentMemory = effective.Memory
 	}
@@ -291,6 +321,31 @@ func (r *ShadowWorkloadReconciler) resizePhantom(ctx context.Context, pod *corev
 		pod.Spec.Containers[i].Resources.Limits = resources.DeepCopy()
 	}
 	return r.SubResource("resize").Patch(ctx, pod, client.StrategicMergeFrom(base))
+}
+
+// nodeConditionReason maps a shadow.NodeEligible reason onto the Degraded
+// condition reason reported in the ShadowWorkload status.
+func nodeConditionReason(eligibilityReason string) string {
+	switch eligibilityReason {
+	case shadow.NodeReasonTerminating:
+		return reasonNodeTerminating
+	case shadow.NodeReasonNotReady:
+		return reasonNodeNotReady
+	default:
+		return reasonNodeMissing
+	}
+}
+
+// warnOnDegradedTransition emits a warning event only when the previously
+// recorded Degraded condition carries a different reason. A steady poll clock
+// (30s by default) would otherwise spam the event stream while a node stays
+// down; identical consecutive reasons are already visible via the status.
+func (r *ShadowWorkloadReconciler) warnOnDegradedTransition(sw *symbiontv1alpha1.ShadowWorkload, reason, msg string) {
+	if cur := meta.FindStatusCondition(sw.Status.Conditions, conditionDegraded); cur != nil &&
+		cur.Reason == reason && cur.Status == metav1.ConditionTrue {
+		return
+	}
+	r.Recorder.Eventf(sw, corev1.EventTypeWarning, reason, "%s", msg)
 }
 
 func ownedBySw(pod *corev1.Pod, sw *symbiontv1alpha1.ShadowWorkload) bool {

@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -45,6 +46,54 @@ type stubQuerier struct {
 
 func (s *stubQuerier) QueryPair(_ context.Context, _ sources.Queries) (float64, float64, bool, error) {
 	return s.cpu, s.mem, true, nil
+}
+
+// drainEvents empties the fake recorder's event channel without blocking and
+// returns the drained event strings.
+func drainEvents(recorder *record.FakeRecorder) []string {
+	var out []string
+	for {
+		select {
+		case e := <-recorder.Events:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
+}
+
+// makeTestNode builds a Node fixture sized like the lab host so resize
+// admission has allocatable to check against. ready controls whether a
+// NodeReady=True condition is reported (nil = no Ready condition at all).
+func makeTestNode(name string, ready *corev1.ConditionStatus) *corev1.Node {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	capacity := corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("32"),
+		corev1.ResourceMemory: resource.MustParse("64Gi"),
+		corev1.ResourcePods:   resource.MustParse("110"),
+	}
+	node.Status.Capacity = capacity
+	node.Status.Allocatable = capacity.DeepCopy()
+	if ready != nil {
+		node.Status.Conditions = []corev1.NodeCondition{{
+			Type:               corev1.NodeReady,
+			Status:             *ready,
+			LastTransitionTime: metav1.Now(),
+		}}
+	}
+	return node
+}
+
+var readyTrue = corev1.ConditionTrue
+
+func filterWarnings(events []string) []string {
+	var out []string
+	for _, e := range events {
+		if len(e) >= 7 && e[:7] == "Warning" {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func validShadowWorkload(name string) *symbiontv1alpha1.ShadowWorkload {
@@ -83,6 +132,7 @@ var _ = Describe("ShadowWorkload Controller", func() {
 	var (
 		reconciler *ShadowWorkloadReconciler
 		stub       *stubQuerier
+		fakeEvents *record.FakeRecorder
 	)
 
 	// deleteAndWait makes cleanup deterministic: envtest ships no garbage
@@ -110,7 +160,9 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "lab"}}
 		// In-place resize admission validates the delta against the node's
 		// allocatable; a bare Node fixture reports zero and would reject the
-		// resize. Size it like the real lab host (64GB RAM).
+		// resize. Size it like the real lab host (64GB RAM). Real kubelets
+		// also report NodeReady=True, and the reconciler requires it before
+		// creating or resizing any phantom.
 		capacity := corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("32"),
 			corev1.ResourceMemory: resource.MustParse("64Gi"),
@@ -118,13 +170,19 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		}
 		node.Status.Capacity = capacity
 		node.Status.Allocatable = capacity.DeepCopy()
+		node.Status.Conditions = []corev1.NodeCondition{{
+			Type:               corev1.NodeReady,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: metav1.Now(),
+		}}
 		Expect(k8sClient.Create(ctx, node)).To(Succeed())
 
 		stub = &stubQuerier{cpu: 2, mem: 6 * 1024 * 1024 * 1024}
+		fakeEvents = record.NewFakeRecorder(64)
 		reconciler = &ShadowWorkloadReconciler{
 			Client:   k8sClient,
 			Scheme:   k8sClient.Scheme(),
-			Recorder: record.NewFakeRecorder(64),
+			Recorder: fakeEvents,
 			QuerierFor: func(string) (MetricsQuerier, error) {
 				return stub, nil
 			},
@@ -212,5 +270,126 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(k8sClient.Get(ctx, key, updated)).To(Succeed())
 		Expect(updated.Status.CurrentCPU.String()).To(Equal("10m"))
 		Expect(updated.Status.CurrentMemory.String()).To(Equal("32Mi"))
+	})
+
+	It("should not create a phantom when the target node does not exist", func() {
+		By("creating a ShadowWorkload pinned to a node that was never registered")
+		sw := validShadowWorkload("ghost-node-sw")
+		sw.Spec.Node = "ghost"
+		Expect(k8sClient.Create(ctx, sw)).To(Succeed())
+		defer deleteAndWait(&symbiontv1alpha1.ShadowWorkload{
+			ObjectMeta: metav1.ObjectMeta{Name: "ghost-node-sw", Namespace: key.Namespace},
+		})
+		swKey := types.NamespacedName{Name: "ghost-node-sw", Namespace: key.Namespace}
+		phantomKey := types.NamespacedName{Name: "shadow-ghost-node-sw", Namespace: key.Namespace}
+
+		By("reconciling twice on the poll clock")
+		for range 2 {
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: swKey})
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		By("asserting no phantom was stranded Pending")
+		pod := &corev1.Pod{}
+		notReadyErr := k8sClient.Get(ctx, phantomKey, pod)
+		Expect(apierrors.IsNotFound(notReadyErr)).To(BeTrue(), "no phantom may exist while the node is not Ready")
+
+		updated := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, swKey, updated)).To(Succeed())
+		Expect(updated.Status.PhantomPod).To(BeEmpty())
+		Expect(meta.IsStatusConditionTrue(updated.Status.Conditions, "Degraded")).To(BeTrue())
+		degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+		Expect(degraded.Reason).To(Equal("NodeMissing"))
+		Expect(meta.IsStatusConditionFalse(updated.Status.Conditions, "Ready")).To(BeTrue())
+
+		By("asserting the warning event fired on transition only, not every poll")
+		events := drainEvents(fakeEvents)
+		warnings := filterWarnings(events)
+		Expect(warnings).To(HaveLen(1), "steady-poll reconciles must not spam warning events: %v", warnings)
+	})
+
+	It("should defer phantom creation until the node reports Ready", func() {
+		By("registering a node that has never reported Ready")
+		node := makeTestNode("late", nil)
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		defer deleteAndWait(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "late"}})
+
+		sw := validShadowWorkload("late-node-sw")
+		sw.Spec.Node = "late"
+		Expect(k8sClient.Create(ctx, sw)).To(Succeed())
+		defer deleteAndWait(&symbiontv1alpha1.ShadowWorkload{
+			ObjectMeta: metav1.ObjectMeta{Name: "late-node-sw", Namespace: key.Namespace},
+		})
+		swKey := types.NamespacedName{Name: "late-node-sw", Namespace: key.Namespace}
+		phantomKey := types.NamespacedName{Name: "shadow-late-node-sw", Namespace: key.Namespace}
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: swKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		pod := &corev1.Pod{}
+		notReadyErr := k8sClient.Get(ctx, phantomKey, pod)
+		Expect(apierrors.IsNotFound(notReadyErr)).To(BeTrue(), "no phantom may exist while the node is not Ready")
+		updated := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, swKey, updated)).To(Succeed())
+		degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+		Expect(degraded).NotTo(BeNil())
+		Expect(degraded.Reason).To(Equal("NodeNotReady"))
+
+		By("reporting the node Ready and reconciling once more")
+		node.Status.Conditions = []corev1.NodeCondition{{
+			Type: corev1.NodeReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.Now(),
+		}}
+		Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: swKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		Eventually(func() error {
+			return k8sClient.Get(ctx, phantomKey, pod)
+		}).Should(Succeed(), "phantom should appear on the first eligible reconcile")
+		Expect(pod.Spec.NodeName).To(Equal("late"))
+		Expect(k8sClient.Get(ctx, swKey, updated)).To(Succeed())
+		Expect(updated.Status.PhantomPod).To(Equal(phantomKey.Name))
+		Expect(meta.IsStatusConditionTrue(updated.Status.Conditions, "Ready")).To(BeTrue())
+	})
+
+	It("should not create a phantom while the node is terminating", func() {
+		By("deleting a Ready node held open by a test finalizer")
+		node := makeTestNode("doomed", &readyTrue)
+		node.Finalizers = []string{"symbiont.tensorhost.com/test-hold"}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		defer func() {
+			held := &corev1.Node{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "doomed"}, held); err == nil {
+				held.Finalizers = nil
+				_ = k8sClient.Update(ctx, held)
+			}
+			deleteAndWait(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "doomed"}})
+		}()
+		Expect(k8sClient.Delete(ctx, node)).To(Succeed())
+
+		held := &corev1.Node{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "doomed"}, held)).To(Succeed())
+		Expect(held.DeletionTimestamp).NotTo(BeNil())
+
+		sw := validShadowWorkload("doomed-node-sw")
+		sw.Spec.Node = "doomed"
+		Expect(k8sClient.Create(ctx, sw)).To(Succeed())
+		defer deleteAndWait(&symbiontv1alpha1.ShadowWorkload{
+			ObjectMeta: metav1.ObjectMeta{Name: "doomed-node-sw", Namespace: key.Namespace},
+		})
+		swKey := types.NamespacedName{Name: "doomed-node-sw", Namespace: key.Namespace}
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: swKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		notFoundErr := k8sClient.Get(ctx,
+			types.NamespacedName{Name: "shadow-doomed-node-sw", Namespace: key.Namespace}, &corev1.Pod{})
+		Expect(apierrors.IsNotFound(notFoundErr)).To(BeTrue(), "no phantom may exist while the node is terminating")
+		updated := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, swKey, updated)).To(Succeed())
+		degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+		Expect(degraded).NotTo(BeNil())
+		Expect(degraded.Reason).To(Equal("NodeTerminating"))
 	})
 })

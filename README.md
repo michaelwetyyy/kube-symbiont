@@ -65,7 +65,7 @@ Exactly one source per ShadowWorkload; each resolves to a CPU-cores + memory-byt
 
 ## Quickstart
 
-Prerequisites: Go 1.24+, kubectl, kustomize (Makefile fetches tools locally), and a cluster
+Prerequisites: Go 1.26+ (go.mod declares go 1.26.0), kubectl, kustomize (Makefile fetches tools locally), and a cluster
 running Kubernetes ≥ 1.29 with Prometheus already scraping cAdvisor.
 
 ```sh
