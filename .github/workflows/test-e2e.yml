@@ -25,7 +25,7 @@ jobs:
 
       - name: Install kind v0.30.0
         run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.30.0/kind-linux-$(go env GOARCH)
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/v0.30.0/kind-linux-$(go env GOARCH)"
           echo '517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889  ./kind' | sha256sum --check
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
