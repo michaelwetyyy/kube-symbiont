@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -154,7 +153,7 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	measuredCPU, measuredMem := 0.0, 0.0
 	if nodeEligible {
-		r.measure(ctx, &sw, log, setDegraded, &measuredCPU, &measuredMem)
+		r.measure(ctx, &sw, setDegraded, &measuredCPU, &measuredMem)
 	}
 
 	floor := sw.Spec.Update.Floor
@@ -279,10 +278,10 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 func (r *ShadowWorkloadReconciler) measure(
 	ctx context.Context,
 	sw *symbiontv1alpha1.ShadowWorkload,
-	log logr.Logger,
 	setDegraded func(reason, format string, args ...any),
 	cpuOut, memOut *float64,
 ) {
+	log := logf.FromContext(ctx)
 	queries, err := sources.Resolve(&sw.Spec)
 	if err != nil {
 		setDegraded(reasonSourceInvalid, "%v", err)
@@ -367,7 +366,11 @@ func pollInterval(sw *symbiontv1alpha1.ShadowWorkload) time.Duration {
 // reconcile; the poll clock keeps the metric-driven cadence regardless.
 func (r *ShadowWorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
-		r.Recorder = mgr.GetEventRecorderFor("kube-symbiont")
+		// GetEventRecorder returns the newer events recorder, which does not
+		// implement the record.EventRecorder interface used by the fake recorder
+		// in controller tests. Keep the compatible recorder until that interface
+		// migration can be made deliberately across production and tests.
+		r.Recorder = mgr.GetEventRecorderFor("kube-symbiont") //nolint:staticcheck
 	}
 	if r.QuerierFor == nil {
 		r.QuerierFor = func(rawURL string) (MetricsQuerier, error) {

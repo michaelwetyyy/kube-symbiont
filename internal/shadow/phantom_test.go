@@ -28,14 +28,11 @@ import (
 	symbiontv1alpha1 "github.com/michaelwetyyy/kube-symbiont/api/v1alpha1"
 )
 
-func q(t *testing.T, s string) resource.Quantity {
-	t.Helper()
-	qq, err := resource.ParseQuantity(s)
-	if err != nil {
-		t.Fatalf("parse quantity %q: %v", s, err)
-	}
-	return qq
-}
+const (
+	minimumCPU    = "10m"
+	minimumMemory = "32Mi"
+	sixGiB        = "6Gi"
+)
 
 func pair(cpu, mem string) symbiontv1alpha1.ResourcePair {
 	return symbiontv1alpha1.ResourcePair{
@@ -79,7 +76,7 @@ func TestPhantomName(t *testing.T) {
 }
 
 func TestClamp(t *testing.T) {
-	floor := pair("10m", "32Mi")
+	floor := pair(minimumCPU, minimumMemory)
 	ceiling := pair("8", "32Gi")
 
 	tests := []struct {
@@ -87,12 +84,12 @@ func TestClamp(t *testing.T) {
 		desired      symbiontv1alpha1.ResourcePair
 		wantCPU, mem string
 	}{
-		{"below floor clamps up", pair("1m", "1Mi"), "10m", "32Mi"},
+		{"below floor clamps up", pair("1m", "1Mi"), minimumCPU, minimumMemory},
 		{"above ceiling clamps down", pair("100", "64Gi"), "8", "32Gi"},
-		{"between passes through", pair("1500m", "6Gi"), "1500m", "6Gi"},
-		{"workload off settles at floor", pair("0", "0"), "10m", "32Mi"},
-		{"exactly at bounds unchanged", floor, "10m", "32Mi"},
-		{"cpu below mem above", pair("1m", "64Gi"), "10m", "32Gi"},
+		{"between passes through", pair("1500m", sixGiB), "1500m", sixGiB},
+		{"workload off settles at floor", pair("0", "0"), minimumCPU, minimumMemory},
+		{"exactly at bounds unchanged", floor, minimumCPU, minimumMemory},
+		{"cpu below mem above", pair("1m", "64Gi"), minimumCPU, "32Gi"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -140,7 +137,7 @@ func TestPairOf(t *testing.T) {
 	if p.CPU.String() != "1234m" && p.CPU.String() != "1235m" {
 		t.Fatalf("CPU rounding unexpected: %s", p.CPU.String())
 	}
-	if p.Memory.String() != "6Gi" {
+	if p.Memory.String() != sixGiB {
 		t.Fatalf("Memory = %s, want 6Gi", p.Memory.String())
 	}
 }
@@ -173,7 +170,7 @@ func swFixture() *symbiontv1alpha1.ShadowWorkload {
 			Update: symbiontv1alpha1.UpdatePolicy{
 				DeltaThresholdPercent: 10,
 				PollInterval:          "30s",
-				Floor:                 pair("10m", "32Mi"),
+				Floor:                 pair(minimumCPU, minimumMemory),
 				Ceiling:               pair("8", "32Gi"),
 			},
 		},
@@ -185,7 +182,7 @@ func swFixture() *symbiontv1alpha1.ShadowWorkload {
 // resize policy for cpu AND memory, ballast PriorityClass, controller ownerRef.
 func TestBuildPhantomPod(t *testing.T) {
 	sw := swFixture()
-	initial := pair("1200m", "6Gi")
+	initial := pair("1200m", sixGiB)
 	pod, err := BuildPhantomPod(sw, testScheme(t), initial)
 	if err != nil {
 		t.Fatalf("BuildPhantomPod: %v", err)
@@ -216,7 +213,7 @@ func TestBuildPhantomPod(t *testing.T) {
 		}
 	}
 	cpuReq, memReq := req[corev1.ResourceCPU], req[corev1.ResourceMemory]
-	if cpuReq.String() != "1200m" || memReq.String() != "6Gi" {
+	if cpuReq.String() != "1200m" || memReq.String() != sixGiB {
 		t.Errorf("initial pair wrong: cpu=%s memory=%s", cpuReq.String(), memReq.String())
 	}
 

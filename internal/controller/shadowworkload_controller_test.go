@@ -84,6 +84,11 @@ func makeTestNode(name string, ready *corev1.ConditionStatus) *corev1.Node {
 	return node
 }
 
+const (
+	testNodeName        = "lab"
+	terminatingNodeName = "doomed"
+)
+
 var readyTrue = corev1.ConditionTrue
 
 func filterWarnings(events []string) []string {
@@ -100,7 +105,7 @@ func validShadowWorkload(name string) *symbiontv1alpha1.ShadowWorkload {
 	return &symbiontv1alpha1.ShadowWorkload{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
 		Spec: symbiontv1alpha1.ShadowWorkloadSpec{
-			Node: "lab",
+			Node: testNodeName,
 			Source: symbiontv1alpha1.SourceSpec{
 				Type:   symbiontv1alpha1.SourceTypeDocker,
 				Docker: &symbiontv1alpha1.DockerSource{Selector: symbiontv1alpha1.SelectorAll},
@@ -157,7 +162,7 @@ var _ = Describe("ShadowWorkload Controller", func() {
 			GlobalDefault: false,
 		}
 		Expect(k8sClient.Create(ctx, pc)).To(Succeed())
-		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "lab"}}
+		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName}}
 		// In-place resize admission validates the delta against the node's
 		// allocatable; a bare Node fixture reports zero and would reject the
 		// resize. Size it like the real lab host (64GB RAM). Real kubelets
@@ -194,7 +199,7 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		deleteAndWait(sw)
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "shadow-" + key.Name, Namespace: key.Namespace}}
 		deleteAndWait(pod)
-		deleteAndWait(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "lab"}})
+		deleteAndWait(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName}})
 		deleteAndWait(&schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: shadow.BallastPriorityClassName}})
 	})
 
@@ -221,7 +226,7 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Eventually(func() error {
 			return k8sClient.Get(ctx, phantomKey, pod)
 		}).Should(Succeed())
-		Expect(pod.Spec.NodeName).To(Equal("lab"))
+		Expect(pod.Spec.NodeName).To(Equal(testNodeName))
 		Expect(pod.Spec.PriorityClassName).To(Equal(shadow.BallastPriorityClassName))
 		req := pod.Spec.Containers[0].Resources.Requests
 		lim := pod.Spec.Containers[0].Resources.Limits
@@ -355,25 +360,25 @@ var _ = Describe("ShadowWorkload Controller", func() {
 
 	It("should not create a phantom while the node is terminating", func() {
 		By("deleting a Ready node held open by a test finalizer")
-		node := makeTestNode("doomed", &readyTrue)
+		node := makeTestNode(terminatingNodeName, &readyTrue)
 		node.Finalizers = []string{"symbiont.tensorhost.com/test-hold"}
 		Expect(k8sClient.Create(ctx, node)).To(Succeed())
 		defer func() {
 			held := &corev1.Node{}
-			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "doomed"}, held); err == nil {
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: terminatingNodeName}, held); err == nil {
 				held.Finalizers = nil
 				_ = k8sClient.Update(ctx, held)
 			}
-			deleteAndWait(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "doomed"}})
+			deleteAndWait(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: terminatingNodeName}})
 		}()
 		Expect(k8sClient.Delete(ctx, node)).To(Succeed())
 
 		held := &corev1.Node{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "doomed"}, held)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: terminatingNodeName}, held)).To(Succeed())
 		Expect(held.DeletionTimestamp).NotTo(BeNil())
 
 		sw := validShadowWorkload("doomed-node-sw")
-		sw.Spec.Node = "doomed"
+		sw.Spec.Node = terminatingNodeName
 		Expect(k8sClient.Create(ctx, sw)).To(Succeed())
 		defer deleteAndWait(&symbiontv1alpha1.ShadowWorkload{
 			ObjectMeta: metav1.ObjectMeta{Name: "doomed-node-sw", Namespace: key.Namespace},
