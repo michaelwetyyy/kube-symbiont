@@ -94,7 +94,7 @@ spec:
     docker:
       selector: all              # every bare-metal container on the node
       cadvisorJob: cadvisor      # standalone cAdvisor's Prometheus job label
-      cadvisorInstance: "192.0.2.10:4194"   # optional scoping
+      cadvisorInstance: "192.0.2.10:4194"      # optional scoping; documentation address
   metrics:
     prometheusURL: http://kube-prometheus-stack-prometheus.monitoring:9090
     window: 5m                   # moving-average smoothing horizon

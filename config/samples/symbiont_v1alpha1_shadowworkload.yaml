@@ -19,7 +19,7 @@ spec:
     docker:
       selector: all            # every bare-metal Docker container on the node
       cadvisorJob: cadvisor    # Prometheus job label of standalone cAdvisor
-      cadvisorInstance: 192.0.2.10:4194   # scope to this node's series
+      cadvisorInstance: 192.0.2.10:4194   # documentation address; replace with the target series
 
   metrics:
     prometheusURL: http://kube-prometheus-stack-prometheus.monitoring:9090
