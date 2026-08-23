@@ -112,10 +112,12 @@ type DockerSource struct {
 	// +kubebuilder:default="cadvisor"
 	CadvisorJob string `json:"cadvisorJob,omitempty"`
 
-	// cadvisorInstance optionally pins the instance label (e.g.
-	// "192.0.2.10:4194") to scope queries to one node's cAdvisor series.
-	// +optional
-	CadvisorInstance string `json:"cadvisorInstance,omitempty"`
+	// cadvisorInstance pins the Prometheus instance label (e.g.
+	// "192.0.2.10:4194") to this node's standalone cAdvisor target. It is
+	// required so a multi-target job can never aggregate other nodes into this
+	// node's scheduler reservation.
+	// +kubebuilder:validation:MinLength=1
+	CadvisorInstance string `json:"cadvisorInstance"`
 }
 
 // PromQLSource passes raw CPU/memory queries straight through to Prometheus.

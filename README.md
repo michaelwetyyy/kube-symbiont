@@ -80,6 +80,19 @@ kubectl apply -f config/samples/symbiont_v1alpha1_shadowworkload.yaml
 kubectl get shadowworkloads -o wide     # or: kubectl get sw
 ```
 
+Release installs can use the self-contained manifest or Helm chart:
+
+```sh
+kubectl apply -f https://github.com/michaelwetyyy/kube-symbiont/releases/download/v0.1.0/install.yaml
+
+helm upgrade --install kube-symbiont ./charts/chart \
+  --namespace kube-symbiont-system --create-namespace
+```
+
+Published images are multi-platform (`linux/amd64`, `linux/arm64`), run as numeric non-root
+UID/GID 65532, use pinned build/runtime bases, and carry BuildKit SBOM plus GitHub provenance
+attestations. Release installers pin the image manifest digest.
+
 ### Example
 
 ```yaml
@@ -94,7 +107,7 @@ spec:
     docker:
       selector: all              # every bare-metal container on the node
       cadvisorJob: cadvisor      # standalone cAdvisor's Prometheus job label
-      cadvisorInstance: "192.0.2.10:4194"      # optional scoping; documentation address
+      cadvisorInstance: "192.0.2.10:4194"      # required per-node target; documentation address
   metrics:
     prometheusURL: http://kube-prometheus-stack-prometheus.monitoring:9090
     window: 5m                   # moving-average smoothing horizon
@@ -139,6 +152,9 @@ make manifests generate   # regenerate CRDs/RBAC/deepcopy after API edits
   `pollInterval` plus window smoothing of lag, by design.
 - **Prometheus dependency.** Measurement quality equals scrape coverage; a dead Prometheus
   freezes the phantom at its last size rather than shrinking it.
+- **Trusted configuration boundary.** A `ShadowWorkload` author selects the Prometheus URL and,
+  for raw `promql`, the query. Grant CR write access only to trusted operators; do not expose it
+  as an untrusted multi-tenant API.
 - **Single-node targeting.** Each ShadowWorkload pins one node; multi-host bare metal means
   one resource per host.
 

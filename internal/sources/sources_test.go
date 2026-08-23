@@ -55,24 +55,24 @@ func TestResolveDockerGeneratesIDPrefixSelectors(t *testing.T) {
 	}
 }
 
-func TestResolveDockerDefaultsAndOmittedInstance(t *testing.T) {
-	q, err := Resolve(dockerSpec("", ""))
+func TestResolveDockerDefaultsJobAndRequiresInstance(t *testing.T) {
+	q, err := Resolve(dockerSpec("", "192.0.2.10:4194"))
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
 	if !strings.Contains(q.CPUCores, `job="cadvisor"`) {
 		t.Errorf("default job label missing: %s", q.CPUCores)
 	}
-	if strings.Contains(q.CPUCores, "instance=") {
-		t.Errorf("unexpected instance label: %s", q.CPUCores)
-	}
 	if !strings.Contains(q.CPUCores, "[5m]") || !strings.Contains(q.MemoryBytes, "[5m]") {
 		t.Errorf("window not injected: %s | %s", q.CPUCores, q.MemoryBytes)
+	}
+	if _, err := Resolve(dockerSpec("cadvisor", "")); err == nil {
+		t.Fatal("omitted instance must be rejected to prevent cross-node aggregation")
 	}
 }
 
 func TestResolveDockerEscapesLabelValues(t *testing.T) {
-	q, err := Resolve(dockerSpec(`my"job\`, ""))
+	q, err := Resolve(dockerSpec(`my"job\`, "192.0.2.10:4194"))
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}

@@ -161,7 +161,7 @@ func swFixture() *symbiontv1alpha1.ShadowWorkload {
 			Node: "lab",
 			Source: symbiontv1alpha1.SourceSpec{
 				Type:   symbiontv1alpha1.SourceTypeDocker,
-				Docker: &symbiontv1alpha1.DockerSource{Selector: symbiontv1alpha1.SelectorAll},
+				Docker: &symbiontv1alpha1.DockerSource{Selector: symbiontv1alpha1.SelectorAll, CadvisorInstance: "192.0.2.10:4194"},
 			},
 			Metrics: symbiontv1alpha1.MetricsConfig{
 				PrometheusURL: "http://prom:9090",
@@ -174,6 +174,30 @@ func swFixture() *symbiontv1alpha1.ShadowWorkload {
 				Ceiling:               pair("8", "32Gi"),
 			},
 		},
+	}
+}
+
+func assertRestrictedSecurity(t *testing.T, pod *corev1.Pod, c corev1.Container) {
+	t.Helper()
+	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.SeccompProfile == nil ||
+		pod.Spec.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Error("pod must use the RuntimeDefault seccomp profile")
+	}
+	if c.SecurityContext == nil {
+		t.Fatal("container security context is required")
+	}
+	if c.SecurityContext.AllowPrivilegeEscalation == nil || *c.SecurityContext.AllowPrivilegeEscalation {
+		t.Error("container must disable privilege escalation")
+	}
+	if c.SecurityContext.RunAsNonRoot == nil || !*c.SecurityContext.RunAsNonRoot {
+		t.Error("container must require a non-root user")
+	}
+	if c.SecurityContext.RunAsUser == nil || *c.SecurityContext.RunAsUser == 0 {
+		t.Error("container must set a numeric non-root user")
+	}
+	if c.SecurityContext.Capabilities == nil || len(c.SecurityContext.Capabilities.Drop) != 1 ||
+		c.SecurityContext.Capabilities.Drop[0] != "ALL" {
+		t.Error("container must drop all capabilities")
 	}
 }
 
@@ -204,6 +228,7 @@ func TestBuildPhantomPod(t *testing.T) {
 	if c.Image != PhantomImage {
 		t.Errorf("Image = %q, want %q", c.Image, PhantomImage)
 	}
+	assertRestrictedSecurity(t, pod, c)
 
 	req, lim := c.Resources.Requests, c.Resources.Limits
 	for _, dim := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -42,10 +43,11 @@ import (
 type stubQuerier struct {
 	cpu float64
 	mem float64
+	err error
 }
 
 func (s *stubQuerier) QueryPair(_ context.Context, _ sources.Queries) (float64, float64, bool, error) {
-	return s.cpu, s.mem, true, nil
+	return s.cpu, s.mem, true, s.err
 }
 
 // drainEvents empties the fake recorder's event channel without blocking and
@@ -108,7 +110,7 @@ func validShadowWorkload(name string) *symbiontv1alpha1.ShadowWorkload {
 			Node: testNodeName,
 			Source: symbiontv1alpha1.SourceSpec{
 				Type:   symbiontv1alpha1.SourceTypeDocker,
-				Docker: &symbiontv1alpha1.DockerSource{Selector: symbiontv1alpha1.SelectorAll},
+				Docker: &symbiontv1alpha1.DockerSource{Selector: symbiontv1alpha1.SelectorAll, CadvisorInstance: "192.0.2.10:4194"},
 			},
 			Metrics: symbiontv1alpha1.MetricsConfig{
 				PrometheusURL: "http://prometheus.monitoring:9090",
@@ -275,6 +277,90 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(k8sClient.Get(ctx, key, updated)).To(Succeed())
 		Expect(updated.Status.CurrentCPU.String()).To(Equal("10m"))
 		Expect(updated.Status.CurrentMemory.String()).To(Equal("32Mi"))
+	})
+
+	It("should preserve accepted requests and status when a resize is rejected", func() {
+		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		phantomKey := types.NamespacedName{Name: "shadow-" + resourceName, Namespace: key.Namespace}
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, phantomKey, pod)).To(Succeed())
+		Expect(pod.Spec.Containers[0].Resources.Requests.Memory().String()).To(Equal("6Gi"))
+
+		By("requesting more memory than the node can admit")
+		current := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, current)).To(Succeed())
+		current.Spec.Update.Ceiling.Memory = resource.MustParse("128Gi")
+		Expect(k8sClient.Update(ctx, current)).To(Succeed())
+		stub.mem = 128 * 1024 * 1024 * 1024
+
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("keeping both the Pod and ShadowWorkload status at last accepted truth")
+		Expect(k8sClient.Get(ctx, phantomKey, pod)).To(Succeed())
+		Expect(pod.Spec.Containers[0].Resources.Requests.Memory().String()).To(Equal("6Gi"))
+		Expect(k8sClient.Get(ctx, key, current)).To(Succeed())
+		Expect(current.Status.CurrentMemory.String()).To(Equal("6Gi"))
+		degraded := meta.FindStatusCondition(current.Status.Conditions, "Degraded")
+		Expect(degraded).NotTo(BeNil())
+		Expect(degraded.Reason).To(Equal("ResizeRejected"))
+	})
+
+	It("should retain last truth during a metrics outage and recover", func() {
+		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		before := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, before)).To(Succeed())
+		lastResize := before.Status.LastResize
+		stub.err = errors.New("test metrics outage")
+		stub.cpu, stub.mem = 4, 12*1024*1024*1024
+
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		outage := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, outage)).To(Succeed())
+		Expect(outage.Status.CurrentCPU.String()).To(Equal("2"))
+		Expect(outage.Status.CurrentMemory.String()).To(Equal("6Gi"))
+		Expect(outage.Status.LastResize.Equal(&lastResize)).To(BeTrue())
+		Expect(meta.FindStatusCondition(outage.Status.Conditions, "Degraded").Reason).To(Equal("PrometheusUnavailable"))
+
+		stub.err = nil
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		recovered := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, recovered)).To(Succeed())
+		Expect(recovered.Status.CurrentCPU.String()).To(Equal("4"))
+		Expect(meta.IsStatusConditionFalse(recovered.Status.Conditions, "Degraded")).To(BeTrue())
+	})
+
+	It("should adopt the existing phantom after a controller restart", func() {
+		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		restarted := &ShadowWorkloadReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: record.NewFakeRecorder(16),
+			QuerierFor: func(string) (MetricsQuerier, error) {
+				return &stubQuerier{cpu: 2, mem: 6 * 1024 * 1024 * 1024}, nil
+			},
+		}
+		_, err = restarted.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		podList := &corev1.PodList{}
+		Expect(k8sClient.List(ctx, podList, client.InNamespace(key.Namespace),
+			client.MatchingLabels{shadow.LabelShadowWorkload: resourceName})).To(Succeed())
+		Expect(podList.Items).To(HaveLen(1))
+		current := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, current)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(current.Status.Conditions, "Ready")).To(BeTrue())
 	})
 
 	It("should not create a phantom when the target node does not exist", func() {

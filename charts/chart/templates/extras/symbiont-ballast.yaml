@@ -1,0 +1,14 @@
+apiVersion: scheduling.k8s.io/v1
+description: Ballast priority for kube-symbiont phantom pods. High enough that normal
+  (priority-0) workloads cannot preempt a phantom; the phantom must outlive the pods
+  it protects. Install once per cluster alongside the operator.
+globalDefault: false
+kind: PriorityClass
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/name: {{ include "kube-symbiont.name" . }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  name: symbiont-ballast
+value: 1000

@@ -87,9 +87,10 @@ func resolveDocker(docker *symbiontv1alpha1.DockerSource, window string) (Querie
 		job = "cadvisor"
 	}
 	labelMatchers := fmt.Sprintf("job=%s", promLabel(job))
-	if inst := docker.CadvisorInstance; inst != "" {
-		labelMatchers += fmt.Sprintf(",instance=%s", promLabel(inst))
+	if docker.CadvisorInstance == "" {
+		return Queries{}, fmt.Errorf("docker source requires cadvisorInstance for per-node accounting")
 	}
+	labelMatchers += fmt.Sprintf(",instance=%s", promLabel(docker.CadvisorInstance))
 	matchers := "{" + labelMatchers + "," + dockerCgroupIDSelector + "}"
 
 	return Queries{
@@ -160,7 +161,7 @@ func (c *Client) Query(ctx context.Context, expr string) (float64, bool, error) 
 		return 0, false, fmt.Errorf("read prometheus response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return 0, false, fmt.Errorf("prometheus returned %d: %s", resp.StatusCode, truncate(body, 256))
+		return 0, false, fmt.Errorf("prometheus returned HTTP %d", resp.StatusCode)
 	}
 
 	var payload struct {
@@ -225,11 +226,4 @@ func parseSample(s string) (float64, error) {
 		return 0, fmt.Errorf("parse sample %q: %w", s, err)
 	}
 	return v, nil
-}
-
-func truncate(b []byte, n int) string {
-	if len(b) > n {
-		return string(b[:n])
-	}
-	return string(b)
 }

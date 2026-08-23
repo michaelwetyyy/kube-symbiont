@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	symbiontv1alpha1 "github.com/michaelwetyyy/kube-symbiont/api/v1alpha1"
@@ -49,7 +50,7 @@ const (
 	// PhantomImage is the pause image: ~1MB resident RAM regardless of the
 	// requests it carries. The kernel sees ~1MB; the scheduler sees the full
 	// reservation. That asymmetry is the mechanism.
-	PhantomImage = "registry.k8s.io/pause:3.9"
+	PhantomImage = "registry.k8s.io/pause:3.9@sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097"
 
 	// BallastPriorityClassName must be installed out-of-band (see
 	// config/symbiont/priorityclass.yaml). High enough that priority-0
@@ -168,10 +169,22 @@ func BuildPhantomPod(sw *symbiontv1alpha1.ShadowWorkload, scheme *runtime.Scheme
 			NodeName:          sw.Spec.Node,
 			PriorityClassName: BallastPriorityClassName,
 			RestartPolicy:     corev1.RestartPolicyAlways,
+			SecurityContext: &corev1.PodSecurityContext{
+				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			},
 			Containers: []corev1.Container{
 				{
 					Name:  PhantomContainerName,
 					Image: PhantomImage,
+					SecurityContext: &corev1.SecurityContext{
+						AllowPrivilegeEscalation: ptr.To(false),
+						RunAsNonRoot:             ptr.To(true),
+						RunAsUser:                ptr.To[int64](65532),
+						RunAsGroup:               ptr.To[int64](65532),
+						Capabilities: &corev1.Capabilities{
+							Drop: []corev1.Capability{"ALL"},
+						},
+					},
 					Resources: corev1.ResourceRequirements{
 						Requests: requests,
 						Limits:   limits,

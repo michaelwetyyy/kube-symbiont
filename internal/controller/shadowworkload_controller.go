@@ -265,7 +265,7 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	if perr := r.Status().Patch(ctx, &sw, client.MergeFrom(statusBase)); perr != nil {
-		log.Error(perr, "Failed to patch ShadowWorkload status")
+		return ctrl.Result{}, fmt.Errorf("patch ShadowWorkload status: %w", perr)
 	}
 
 	log.Info("Reconciled", "ready", degradedReason == "", "requeueAfter", poll.String())
@@ -311,15 +311,23 @@ func (r *ShadowWorkloadReconciler) measure(
 // would be rejected (or worse, change QoS).
 func (r *ShadowWorkloadReconciler) resizePhantom(ctx context.Context, pod *corev1.Pod, desired symbiontv1alpha1.ResourcePair) error {
 	base := pod.DeepCopy()
+	resized := pod.DeepCopy()
 	resources := corev1.ResourceList{
 		corev1.ResourceCPU:    desired.CPU,
 		corev1.ResourceMemory: desired.Memory,
 	}
-	for i := range pod.Spec.Containers {
-		pod.Spec.Containers[i].Resources.Requests = resources.DeepCopy()
-		pod.Spec.Containers[i].Resources.Limits = resources.DeepCopy()
+	for i := range resized.Spec.Containers {
+		resized.Spec.Containers[i].Resources.Requests = resources.DeepCopy()
+		resized.Spec.Containers[i].Resources.Limits = resources.DeepCopy()
 	}
-	return r.SubResource("resize").Patch(ctx, pod, client.StrategicMergeFrom(base))
+	if err := r.SubResource("resize").Patch(ctx, resized, client.StrategicMergeFrom(base)); err != nil {
+		return err
+	}
+	// Keep the caller's observation aligned with the accepted API mutation so
+	// status reflects the new requests. On rejection, pod remains untouched and
+	// status continues to report the last accepted requests.
+	*pod = *resized
+	return nil
 }
 
 // nodeConditionReason maps a shadow.NodeEligible reason onto the Degraded
