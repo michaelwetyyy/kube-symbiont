@@ -10,7 +10,7 @@ jobs:
   test:
     permissions:
       contents: read
-    name: Run on Ubuntu
+    name: Unit and envtest
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
@@ -26,4 +26,5 @@ jobs:
       - name: Running Tests
         run: |
           go mod tidy
+          git diff --exit-code go.mod go.sum
           make test
