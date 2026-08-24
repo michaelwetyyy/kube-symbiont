@@ -131,9 +131,11 @@ source:
 Behaviour on rough edges: workload off or emitting nothing → phantom settles on the floor;
 brief spikes → absorbed by the moving average; phantom deleted externally → recreated;
 in-place resize rejected → phantom keeps previous requests and the CR reports a `Degraded`
-condition; controller restart → resumes from the phantom's current requests. Admission rejects
-negative resource bounds and floors above ceilings. PromQL must return an empty vector or exactly
-one sample; ambiguous multi-sample results degrade safely instead of selecting by response order.
+condition; missing `symbiont-ballast` PriorityClass → no new phantom/resize and the last accepted
+reservation remains truthful; controller restart → resumes from the phantom's current requests.
+Admission rejects negative resource bounds and floors above ceilings. PromQL must return an empty
+vector or exactly one sample; ambiguous multi-sample results degrade safely instead of selecting by
+response order.
 
 ## Development
 

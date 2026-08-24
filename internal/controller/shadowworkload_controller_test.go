@@ -222,10 +222,10 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		fakeEvents = record.NewFakeRecorder(64)
 		nodeReader = &recordingNodeReader{Reader: k8sClient}
 		reconciler = &ShadowWorkloadReconciler{
-			Client:     k8sClient,
-			Scheme:     k8sClient.Scheme(),
-			Recorder:   fakeEvents,
-			NodeReader: nodeReader,
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Recorder:  fakeEvents,
+			APIReader: nodeReader,
 			QuerierFor: func(string) (MetricsQuerier, error) {
 				return stub, nil
 			},
@@ -405,6 +405,34 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		result, err := failing.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 		Expect(err).To(MatchError(ContainSubstring("patch ShadowWorkload status: injected status patch failure")))
 		Expect(result).To(Equal(reconcile.Result{}))
+	})
+
+	It("should retain last truth when the ballast PriorityClass disappears", func() {
+		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		phantomKey := types.NamespacedName{Name: "shadow-" + resourceName, Namespace: key.Namespace}
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, phantomKey, pod)).To(Succeed())
+		uid := pod.UID
+		requests := pod.Spec.Containers[0].Resources.Requests.DeepCopy()
+
+		deleteAndWait(&schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: shadow.BallastPriorityClassName}})
+		stub.cpu, stub.mem = 4, 12*1024*1024*1024
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, phantomKey, pod)).To(Succeed())
+		Expect(pod.UID).To(Equal(uid))
+		Expect(pod.Spec.Containers[0].Resources.Requests).To(Equal(requests))
+		current := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, current)).To(Succeed())
+		Expect(current.Status.CurrentCPU.String()).To(Equal("2"))
+		Expect(current.Status.CurrentMemory.String()).To(Equal("6Gi"))
+		degraded := meta.FindStatusCondition(current.Status.Conditions, "Degraded")
+		Expect(degraded).NotTo(BeNil())
+		Expect(degraded.Reason).To(Equal("PriorityClassMissing"))
 	})
 
 	It("should adopt the existing phantom after a controller restart", func() {

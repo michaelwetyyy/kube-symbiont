@@ -22,6 +22,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -50,6 +51,7 @@ const (
 	reasonNodeTerminating       = "NodeTerminating"
 	reasonSourceInvalid         = "SourceInvalid"
 	reasonPrometheusUnavailable = "PrometheusUnavailable"
+	reasonPriorityClassMissing  = "PriorityClassMissing"
 	reasonResizeRejected        = "ResizeRejected"
 	reasonPhantomConflict       = "PhantomConflict"
 	reasonAsExpected            = "AsExpected"
@@ -68,9 +70,11 @@ type MetricsQuerier interface {
 // mirroring that footprint on the scheduler ledger.
 type ShadowWorkloadReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	Recorder   record.EventRecorder
-	NodeReader client.Reader
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
+	// APIReader performs get-only cluster-scoped lookups without making the
+	// shared cache require list/watch permissions.
+	APIReader client.Reader
 
 	// QuerierFor builds a metrics querier for a Prometheus URL. Defaults to
 	// sources.NewClient; overridable for tests.
@@ -82,6 +86,7 @@ type ShadowWorkloadReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=pods/resize,verbs=patch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get
+// +kubebuilder:rbac:groups=scheduling.k8s.io,resources=priorityclasses,verbs=get
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile runs the measure → clamp → resize loop:
@@ -132,14 +137,14 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// live again, no phantom is created or resized; the loop retries on the
 	// poll clock and the phantom appears on the first eligible reconcile.
 	var node corev1.Node
-	nodeReader := r.NodeReader
-	if nodeReader == nil {
+	apiReader := r.APIReader
+	if apiReader == nil {
 		// Tests and direct library users may not provide a separate reader. The
-		// production manager always injects its uncached API reader so a Node
-		// GET never causes the shared cache to require list/watch privileges.
-		nodeReader = r.Client
+		// production manager always injects its uncached API reader so get-only
+		// cluster-scoped checks never make the cache require list/watch privileges.
+		apiReader = r.Client
 	}
-	nodeErr := nodeReader.Get(ctx, client.ObjectKey{Name: sw.Spec.Node}, &node)
+	nodeErr := apiReader.Get(ctx, client.ObjectKey{Name: sw.Spec.Node}, &node)
 	nodeEligible := false
 	switch {
 	case nodeErr == nil:
@@ -159,8 +164,24 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, fmt.Errorf("get target node %q: %w", sw.Spec.Node, nodeErr)
 	}
 
-	measuredCPU, measuredMem := 0.0, 0.0
+	prerequisitesReady := nodeEligible
 	if nodeEligible {
+		var priorityClass schedulingv1.PriorityClass
+		priorityErr := apiReader.Get(ctx, client.ObjectKey{Name: shadow.BallastPriorityClassName}, &priorityClass)
+		switch {
+		case priorityErr == nil:
+		case apierrors.IsNotFound(priorityErr):
+			prerequisitesReady = false
+			msg := fmt.Sprintf("required PriorityClass %q is missing; keeping the last accepted reservation", shadow.BallastPriorityClassName)
+			setDegraded(reasonPriorityClassMissing, "%s", msg)
+			r.warnOnDegradedTransition(&sw, reasonPriorityClassMissing, msg)
+		default:
+			return ctrl.Result{}, fmt.Errorf("get required PriorityClass %q: %w", shadow.BallastPriorityClassName, priorityErr)
+		}
+	}
+
+	measuredCPU, measuredMem := 0.0, 0.0
+	if prerequisitesReady {
 		r.measure(ctx, &sw, setDegraded, &measuredCPU, &measuredMem)
 	}
 
@@ -168,10 +189,11 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	ceiling := sw.Spec.Update.Ceiling
 	desired := shadow.Clamp(shadow.PairOf(measuredCPU, measuredMem), floor, ceiling)
 
-	if nodeEligible {
+	if prerequisitesReady {
 		// Ensure the phantom exists and matches the current node pin. Skipped
-		// entirely while the node is ineligible: no create, no resize, and any
-		// pre-existing phantom keeps reporting its last requests as last truth.
+		// entirely while the node or prerequisite is ineligible: no create, no
+		// resize, and any pre-existing phantom keeps reporting its last requests
+		// as last truth.
 		name := shadow.PhantomName(sw.Name)
 		key := client.ObjectKey{Namespace: sw.Namespace, Name: name}
 		var pod corev1.Pod

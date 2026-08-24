@@ -188,9 +188,9 @@ func main() {
 	}
 
 	if err := (&controller.ShadowWorkloadReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		NodeReader: mgr.GetAPIReader(),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "shadowworkload")
 		os.Exit(1)

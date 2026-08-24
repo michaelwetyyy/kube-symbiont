@@ -34,6 +34,12 @@ rules:
   - create
   - patch
 - apiGroups:
+  - scheduling.k8s.io
+  resources:
+  - priorityclasses
+  verbs:
+  - get
+- apiGroups:
   - symbiont.tensorhost.com
   resources:
   - shadowworkloads
