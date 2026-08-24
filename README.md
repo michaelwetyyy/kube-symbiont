@@ -71,7 +71,7 @@ running Kubernetes ≥ 1.29 with Prometheus already scraping cAdvisor.
 ```sh
 # 1. Install namespace + symbiont-ballast PriorityClass + CRDs + operator.
 #    IMG must be pullable from the cluster.
-make deploy IMG=<registry>/kube-symbiont:v0.1.0
+make deploy IMG=<registry>/kube-symbiont:0.1.0
 
 # 2. Point one ShadowWorkload at your bare-metal host.
 kubectl apply -f config/samples/symbiont_v1alpha1_shadowworkload.yaml
