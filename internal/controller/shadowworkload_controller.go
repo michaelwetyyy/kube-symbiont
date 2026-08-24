@@ -68,8 +68,9 @@ type MetricsQuerier interface {
 // mirroring that footprint on the scheduler ledger.
 type ShadowWorkloadReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Scheme     *runtime.Scheme
+	Recorder   record.EventRecorder
+	NodeReader client.Reader
 
 	// QuerierFor builds a metrics querier for a Prometheus URL. Defaults to
 	// sources.NewClient; overridable for tests.
@@ -131,7 +132,14 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// live again, no phantom is created or resized; the loop retries on the
 	// poll clock and the phantom appears on the first eligible reconcile.
 	var node corev1.Node
-	nodeErr := r.Get(ctx, client.ObjectKey{Name: sw.Spec.Node}, &node)
+	nodeReader := r.NodeReader
+	if nodeReader == nil {
+		// Tests and direct library users may not provide a separate reader. The
+		// production manager always injects its uncached API reader so a Node
+		// GET never causes the shared cache to require list/watch privileges.
+		nodeReader = r.Client
+	}
+	nodeErr := nodeReader.Get(ctx, client.ObjectKey{Name: sw.Spec.Node}, &node)
 	nodeEligible := false
 	switch {
 	case nodeErr == nil:

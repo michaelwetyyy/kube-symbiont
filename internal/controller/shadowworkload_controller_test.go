@@ -46,6 +46,18 @@ type stubQuerier struct {
 	err error
 }
 
+type recordingNodeReader struct {
+	client.Reader
+	nodeGets int
+}
+
+func (r *recordingNodeReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.Node); ok {
+		r.nodeGets++
+	}
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
 func (s *stubQuerier) QueryPair(_ context.Context, _ sources.Queries) (float64, float64, bool, error) {
 	return s.cpu, s.mem, true, s.err
 }
@@ -140,6 +152,7 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		reconciler *ShadowWorkloadReconciler
 		stub       *stubQuerier
 		fakeEvents *record.FakeRecorder
+		nodeReader *recordingNodeReader
 	)
 
 	// deleteAndWait makes cleanup deterministic: envtest ships no garbage
@@ -186,10 +199,12 @@ var _ = Describe("ShadowWorkload Controller", func() {
 
 		stub = &stubQuerier{cpu: 2, mem: 6 * 1024 * 1024 * 1024}
 		fakeEvents = record.NewFakeRecorder(64)
+		nodeReader = &recordingNodeReader{Reader: k8sClient}
 		reconciler = &ShadowWorkloadReconciler{
-			Client:   k8sClient,
-			Scheme:   k8sClient.Scheme(),
-			Recorder: fakeEvents,
+			Client:     k8sClient,
+			Scheme:     k8sClient.Scheme(),
+			Recorder:   fakeEvents,
+			NodeReader: nodeReader,
 			QuerierFor: func(string) (MetricsQuerier, error) {
 				return stub, nil
 			},
@@ -264,6 +279,7 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(updated.Status.CurrentCPU.String()).To(Equal("4"))
 		Expect(updated.Status.LastResize.IsZero()).To(BeFalse())
 		Expect(updated.Status.Conditions).NotTo(BeEmpty())
+		Expect(nodeReader.nodeGets).To(BeNumerically(">=", 2), "node eligibility must use the dedicated API reader")
 	})
 
 	It("should floor the phantom when the workload emits nothing", func() {
