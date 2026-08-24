@@ -1,5 +1,6 @@
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
+INSTALLER_IMG ?= ghcr.io/michaelwetyyy/kube-symbiont:0.1.0
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -149,6 +150,11 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 	printf '%s\n' '---' >> dist/install.yaml
 	"$(KUSTOMIZE)" build config/default | sed 's|image: controller:latest|image: ${IMG}|' >> dist/install.yaml
 
+.PHONY: verify-installer
+verify-installer: IMG=$(INSTALLER_IMG)
+verify-installer: build-installer ## Regenerate and verify the fresh-install resource inventory.
+	go test ./internal/install
+
 ##@ Deployment
 
 ifndef ignore-not-found
@@ -173,6 +179,7 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
+	"$(KUSTOMIZE)" build config/symbiont | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
 
 ##@ Dependencies
 

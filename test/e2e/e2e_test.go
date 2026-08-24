@@ -22,6 +22,7 @@ package e2e
 import (
 	"fmt"
 	"os/exec"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -45,19 +46,19 @@ const metricsRoleBindingName = "kube-symbiont-metrics-binding"
 var _ = Describe("Manager", Ordered, func() {
 	var controllerPodName string
 
-	// Before running the tests, install CRDs and deploy the controller. The
-	// deploy target owns namespace creation; exercising that path prevents the
-	// e2e setup from masking a broken release bundle.
+	// Before running the tests, generate and apply the same consolidated file
+	// shipped on releases. Starting from an empty Kind cluster prevents e2e
+	// setup from masking a missing Namespace, PriorityClass, CRD or RBAC object.
 	BeforeAll(func() {
-		By("installing CRDs")
-		cmd := exec.Command("make", "install")
+		By("generating the self-contained installer")
+		cmd := exec.Command("make", "build-installer", fmt.Sprintf("IMG=%s", managerImage))
 		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
+		Expect(err).NotTo(HaveOccurred(), "Failed to generate the installer")
 
-		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
+		By("installing every prerequisite and the manager from one manifest")
+		cmd = exec.Command("kubectl", "apply", "-f", "dist/install.yaml")
 		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+		Expect(err).NotTo(HaveOccurred(), "Failed to apply the installer")
 
 		By("labeling the deployed namespace to enforce the restricted security policy")
 		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
@@ -66,23 +67,18 @@ var _ = Describe("Manager", Ordered, func() {
 		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
 	})
 
-	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
-	// and deleting the namespace.
+	// After all tests have been executed, delete the exact installed manifest.
 	AfterAll(func() {
 		By("cleaning up the curl pod for metrics")
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
 		_, _ = utils.Run(cmd)
 
-		By("undeploying the controller-manager")
-		cmd = exec.Command("make", "undeploy")
+		By("cleaning up the reconciliation test resource")
+		cmd = exec.Command("kubectl", "delete", "shadowworkload", "e2e-shadow", "-n", namespace, "--ignore-not-found")
 		_, _ = utils.Run(cmd)
 
-		By("uninstalling CRDs")
-		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
-
-		By("removing manager namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", namespace)
+		By("deleting the exact consolidated installer")
+		cmd = exec.Command("kubectl", "delete", "-f", "dist/install.yaml", "--ignore-not-found")
 		_, _ = utils.Run(cmd)
 	})
 
@@ -163,6 +159,70 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(output).To(Equal("Running"), "Incorrect controller-manager pod status")
 			}
 			Eventually(verifyControllerUp).Should(Succeed())
+		})
+
+		It("should admit and reconcile a phantom under Restricted Pod Security", func() {
+			By("selecting the isolated Kind node")
+			cmd := exec.Command("kubectl", "get", "nodes", "-o", "jsonpath={.items[0].metadata.name}")
+			nodeName, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			nodeName = strings.TrimSpace(nodeName)
+			Expect(nodeName).NotTo(BeEmpty())
+
+			By("creating a ShadowWorkload whose unavailable metrics backend exercises the safe floor")
+			manifest := fmt.Sprintf(`
+apiVersion: symbiont.tensorhost.com/v1alpha1
+kind: ShadowWorkload
+metadata:
+  name: e2e-shadow
+  namespace: %s
+spec:
+  node: %s
+  source:
+    type: promql
+    promql:
+      cpuCores: vector(0.1)
+      memoryBytes: vector(33554432)
+  metrics:
+    prometheusURL: http://prometheus-does-not-exist.invalid:9090
+    window: 5m
+  update:
+    deltaThresholdPercent: 10
+    pollInterval: 10s
+    floor: {cpu: 10m, memory: 32Mi}
+    ceiling: {cpu: 200m, memory: 64Mi}
+`, namespace, nodeName)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(manifest)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("reporting the unavailable backend without rejecting the Restricted phantom")
+			Eventually(func(g Gomega) {
+				cmd = exec.Command("kubectl", "get", "shadowworkload", "e2e-shadow", "-n", namespace,
+					"-o", `jsonpath={.status.conditions[?(@.type=="Degraded")].reason}`)
+				output, getErr := utils.Run(cmd)
+				g.Expect(getErr).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("PrometheusUnavailable"))
+			}, 2*time.Minute, time.Second).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				cmd = exec.Command("kubectl", "get", "pod", "shadow-e2e-shadow", "-n", namespace,
+					"-o", `jsonpath={.status.phase}{"|"}{.status.qosClass}{"|"}{.spec.containers[0].resources.requests.cpu}{"|"}{.spec.containers[0].resources.requests.memory}{"|"}{.spec.securityContext.seccompProfile.type}{"|"}{.spec.containers[0].securityContext.runAsNonRoot}{"|"}{.spec.containers[0].securityContext.allowPrivilegeEscalation}`)
+				output, getErr := utils.Run(cmd)
+				g.Expect(getErr).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("Running|Guaranteed|10m|32Mi|RuntimeDefault|true|false"))
+			}, 2*time.Minute, time.Second).Should(Succeed())
+
+			By("deleting the owner and verifying phantom garbage collection")
+			cmd = exec.Command("kubectl", "delete", "shadowworkload", "e2e-shadow", "-n", namespace, "--wait=true")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func() bool {
+				cmd = exec.Command("kubectl", "get", "pod", "shadow-e2e-shadow", "-n", namespace)
+				_, getErr := utils.Run(cmd)
+				return getErr != nil
+			}, 2*time.Minute, time.Second).Should(BeTrue())
 		})
 
 		It("should ensure the metrics endpoint is serving metrics", func() {

@@ -51,6 +51,27 @@ type recordingNodeReader struct {
 	nodeGets int
 }
 
+type statusPatchFailingClient struct {
+	client.Client
+}
+
+type statusPatchFailingWriter struct {
+	client.SubResourceWriter
+}
+
+func (c *statusPatchFailingClient) Status() client.SubResourceWriter {
+	return &statusPatchFailingWriter{SubResourceWriter: c.Client.Status()}
+}
+
+func (w *statusPatchFailingWriter) Patch(
+	context.Context,
+	client.Object,
+	client.Patch,
+	...client.SubResourcePatchOption,
+) error {
+	return errors.New("injected status patch failure")
+}
+
 func (r *recordingNodeReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 	if _, ok := obj.(*corev1.Node); ok {
 		r.nodeGets++
@@ -228,6 +249,28 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(apierrors.IsInvalid(err)).To(BeTrue())
 	})
 
+	DescribeTable("should reject unsafe update bounds at admission",
+		func(mutate func(*symbiontv1alpha1.ShadowWorkload)) {
+			bad := validShadowWorkload("bad-update-bounds")
+			mutate(bad)
+			err := k8sClient.Create(ctx, bad)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+		},
+		Entry("negative CPU floor", func(sw *symbiontv1alpha1.ShadowWorkload) {
+			sw.Spec.Update.Floor.CPU = resource.MustParse("-1m")
+		}),
+		Entry("negative memory ceiling", func(sw *symbiontv1alpha1.ShadowWorkload) {
+			sw.Spec.Update.Ceiling.Memory = resource.MustParse("-1Mi")
+		}),
+		Entry("CPU floor above ceiling", func(sw *symbiontv1alpha1.ShadowWorkload) {
+			sw.Spec.Update.Floor.CPU = resource.MustParse("9")
+		}),
+		Entry("memory floor above ceiling", func(sw *symbiontv1alpha1.ShadowWorkload) {
+			sw.Spec.Update.Floor.Memory = resource.MustParse("33Gi")
+		}),
+	)
+
 	It("should create the phantom and resize it in place when drift exceeds the threshold", func() {
 		By("creating a valid ShadowWorkload")
 		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
@@ -352,6 +395,16 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(k8sClient.Get(ctx, key, recovered)).To(Succeed())
 		Expect(recovered.Status.CurrentCPU.String()).To(Equal("4"))
 		Expect(meta.IsStatusConditionFalse(recovered.Status.Conditions, "Degraded")).To(BeTrue())
+	})
+
+	It("should return status patch failures so controller-runtime retries", func() {
+		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
+		failing := *reconciler
+		failing.Client = &statusPatchFailingClient{Client: k8sClient}
+
+		result, err := failing.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).To(MatchError(ContainSubstring("patch ShadowWorkload status: injected status patch failure")))
+		Expect(result).To(Equal(reconcile.Result{}))
 	})
 
 	It("should adopt the existing phantom after a controller restart", func() {

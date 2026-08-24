@@ -251,6 +251,19 @@ spec:
                 - floor
                 - pollInterval
                 type: object
+                x-kubernetes-validations:
+                - message: update.floor.cpu must be non-negative
+                  rule: '!quantity(self.floor.cpu).isLessThan(quantity(''0''))'
+                - message: update.floor.memory must be non-negative
+                  rule: '!quantity(self.floor.memory).isLessThan(quantity(''0''))'
+                - message: update.ceiling.cpu must be non-negative
+                  rule: '!quantity(self.ceiling.cpu).isLessThan(quantity(''0''))'
+                - message: update.ceiling.memory must be non-negative
+                  rule: '!quantity(self.ceiling.memory).isLessThan(quantity(''0''))'
+                - message: update.floor.cpu must not exceed update.ceiling.cpu
+                  rule: '!quantity(self.ceiling.cpu).isLessThan(quantity(self.floor.cpu))'
+                - message: update.floor.memory must not exceed update.ceiling.memory
+                  rule: '!quantity(self.ceiling.memory).isLessThan(quantity(self.floor.memory))'
             required:
             - metrics
             - node

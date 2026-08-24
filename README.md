@@ -131,12 +131,14 @@ source:
 Behaviour on rough edges: workload off or emitting nothing → phantom settles on the floor;
 brief spikes → absorbed by the moving average; phantom deleted externally → recreated;
 in-place resize rejected → phantom keeps previous requests and the CR reports a `Degraded`
-condition; controller restart → resumes from the phantom's current requests.
+condition; controller restart → resumes from the phantom's current requests. Admission rejects
+negative resource bounds and floors above ceilings. PromQL must return an empty vector or exactly
+one sample; ambiguous multi-sample results degrade safely instead of selecting by response order.
 
 ## Development
 
 ```sh
-make test          # unit + envtest suite (envtest binaries fetched automatically)
+make test          # unit + envtest + rendered-installer inventory tests
 make run           # run the manager against your current kubeconfig context
 make manifests generate   # regenerate CRDs/RBAC/deepcopy after API edits
 ```
@@ -154,7 +156,10 @@ make manifests generate   # regenerate CRDs/RBAC/deepcopy after API edits
   freezes the phantom at its last size rather than shrinking it.
 - **Trusted configuration boundary.** A `ShadowWorkload` author selects the Prometheus URL and,
   for raw `promql`, the query. Grant CR write access only to trusted operators; do not expose it
-  as an untrusted multi-tenant API.
+  as an untrusted multi-tenant API. The client rejects embedded credentials, URL query/fragment
+  data and redirects, bounds response size, and never persists backend response bodies or transport
+  destinations in status/events. It does not yet enforce an operator-level destination allowlist;
+  a trusted author can still select another directly reachable HTTP(S) host.
 - **Single-node targeting.** Each ShadowWorkload pins one node; multi-host bare metal means
   one resource per host.
 

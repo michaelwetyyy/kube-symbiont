@@ -28,3 +28,5 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod go.sum
           make test
+          make verify-installer
+          git diff --exit-code

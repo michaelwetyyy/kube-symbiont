@@ -165,6 +165,12 @@ type ResourcePair struct {
 }
 
 // UpdatePolicy governs the measure → clamp → resize loop cadence and hysteresis.
+// +kubebuilder:validation:XValidation:rule="!quantity(self.floor.cpu).isLessThan(quantity('0'))",message="update.floor.cpu must be non-negative"
+// +kubebuilder:validation:XValidation:rule="!quantity(self.floor.memory).isLessThan(quantity('0'))",message="update.floor.memory must be non-negative"
+// +kubebuilder:validation:XValidation:rule="!quantity(self.ceiling.cpu).isLessThan(quantity('0'))",message="update.ceiling.cpu must be non-negative"
+// +kubebuilder:validation:XValidation:rule="!quantity(self.ceiling.memory).isLessThan(quantity('0'))",message="update.ceiling.memory must be non-negative"
+// +kubebuilder:validation:XValidation:rule="!quantity(self.ceiling.cpu).isLessThan(quantity(self.floor.cpu))",message="update.floor.cpu must not exceed update.ceiling.cpu"
+// +kubebuilder:validation:XValidation:rule="!quantity(self.ceiling.memory).isLessThan(quantity(self.floor.memory))",message="update.floor.memory must not exceed update.ceiling.memory"
 type UpdatePolicy struct {
 	// deltaThresholdPercent is the minimum relative change (per dimension,
 	// CPU or memory) between the phantom's current requests and the clamped

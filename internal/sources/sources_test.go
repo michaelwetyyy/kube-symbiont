@@ -155,7 +155,21 @@ func TestClientQuery(t *testing.T) {
 		{
 			name: "prom error status",
 			handler: func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write([]byte(`{"status":"error","errorType":"bad_data","error":"parse error"}`))
+				_, _ = w.Write([]byte(`{"status":"error","errorType":"bad_data","error":"secret-response-body"}`))
+			},
+			wantErr: true,
+		},
+		{
+			name: "multiple samples rejected",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"1"]},{"value":[0,"2"]}]}}`))
+			},
+			wantErr: true,
+		},
+		{
+			name: "non-vector result rejected",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"scalar","result":[{"value":[0,"1"]}]}}`))
 			},
 			wantErr: true,
 		},
@@ -186,6 +200,9 @@ func TestClientQuery(t *testing.T) {
 			if tt.wantErr && err == nil {
 				t.Fatal("want error, got nil")
 			}
+			if err != nil && strings.Contains(err.Error(), "secret-response-body") {
+				t.Fatalf("backend response body leaked into error: %v", err)
+			}
 			if !tt.wantErr && err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -200,9 +217,9 @@ func TestQueryPairCombines(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("query") {
 		case "cpu":
-			_, _ = w.Write([]byte(`{"status":"success","data":{"result":[{"value":[0,"2"]}]}}`))
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"2"]}]}}`))
 		case "mem":
-			_, _ = w.Write([]byte(`{"status":"success","data":{"result":[]}}`))
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
 		default:
 			t.Errorf("unexpected query %q", r.URL.Query().Get("query"))
 		}
@@ -219,7 +236,40 @@ func TestQueryPairCombines(t *testing.T) {
 }
 
 func TestNewClientValidation(t *testing.T) {
-	if _, err := NewClient("ftp://prom:9090", 0); err == nil {
-		t.Error("non-http scheme should be rejected")
+	bad := []string{
+		"ftp://prom:9090",
+		"http:///missing-host",
+		"http://user:password@prom:9090",
+		"http://prom:9090?token=secret",
+		"http://prom:9090#fragment",
+	}
+	for _, rawURL := range bad {
+		if _, err := NewClient(rawURL, 0); err == nil {
+			t.Errorf("NewClient(%q) should reject unsafe URL shape", rawURL)
+		}
+	}
+}
+
+func TestClientRejectsRedirectWithoutLeakingDestination(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("redirect destination must not be reached")
+	}))
+	defer target.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/secret", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	c, err := NewClient(srv.URL, 0)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	_, _, err = c.Query(context.Background(), "up")
+	if err == nil {
+		t.Fatal("redirect should be rejected")
+	}
+	if strings.Contains(err.Error(), target.URL) || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("redirect destination leaked into error: %v", err)
 	}
 }

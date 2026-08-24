@@ -21,6 +21,7 @@ package sources
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -120,23 +121,32 @@ type Client struct {
 func NewClient(rawURL string, timeout time.Duration) (*Client, error) {
 	parsed, err := url.Parse(strings.TrimRight(rawURL, "/"))
 	if err != nil {
-		return nil, fmt.Errorf("invalid prometheusURL %q: %w", rawURL, err)
+		return nil, errors.New("invalid prometheusURL")
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, fmt.Errorf("invalid prometheusURL %q: scheme must be http(s)", rawURL)
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Opaque != "" {
+		return nil, errors.New("invalid prometheusURL: absolute http(s) URL with a host required")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, errors.New("invalid prometheusURL: credentials, query parameters and fragments are not allowed")
 	}
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
 	return &Client{
 		baseURL: parsed,
-		http:    &http.Client{Timeout: timeout},
+		http: &http.Client{
+			Timeout: timeout,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return errors.New("prometheus redirects are disabled")
+			},
+		},
 	}, nil
 }
 
-// Query issues one instant query and returns the first vector sample. An
+// Query issues one instant query and requires exactly one vector sample. An
 // empty vector (workload off, no series) yields (0, false, nil); the caller's
-// floor clamp handles it.
+// floor clamp handles it. Multiple samples are rejected because silently
+// choosing one would make scheduler accounting depend on response ordering.
 func (c *Client) Query(ctx context.Context, expr string) (float64, bool, error) {
 	endpoint := *c.baseURL
 	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/api/v1/query"
@@ -152,7 +162,9 @@ func (c *Client) Query(ctx context.Context, expr string) (float64, bool, error) 
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, false, fmt.Errorf("prometheus query failed: %w", err)
+		// Do not return the transport error: net/http errors can embed the
+		// user-supplied destination and must not be copied into CR status/events.
+		return 0, false, errors.New("prometheus request failed")
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
@@ -166,7 +178,6 @@ func (c *Client) Query(ctx context.Context, expr string) (float64, bool, error) 
 
 	var payload struct {
 		Status string `json:"status"`
-		Error  string `json:"error"`
 		Data   struct {
 			ResultType string `json:"resultType"`
 			Result     []struct {
@@ -178,10 +189,18 @@ func (c *Client) Query(ctx context.Context, expr string) (float64, bool, error) 
 		return 0, false, fmt.Errorf("decode prometheus response: %w", err)
 	}
 	if payload.Status != "success" {
-		return 0, false, fmt.Errorf("prometheus query error: %s", payload.Error)
+		// The backend's response body is untrusted and may contain query text,
+		// internal identifiers or reflected secrets. Keep the durable error fixed.
+		return 0, false, errors.New("prometheus query returned an error status")
+	}
+	if payload.Data.ResultType != "vector" {
+		return 0, false, fmt.Errorf("unexpected prometheus result type %q; want vector", payload.Data.ResultType)
 	}
 	if len(payload.Data.Result) == 0 {
 		return 0, false, nil
+	}
+	if len(payload.Data.Result) != 1 {
+		return 0, false, fmt.Errorf("prometheus query returned %d samples; aggregate to one", len(payload.Data.Result))
 	}
 	raw := payload.Data.Result[0].Value[1]
 	str, ok := raw.(string)
