@@ -359,7 +359,7 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, fmt.Errorf("patch ShadowWorkload status: %w", perr)
 	}
 
-	log.Info("Reconciled", "ready", degradedReason == "", "requeueAfter", poll.String())
+	log.V(1).Info("Reconciled", "ready", degradedReason == "", "requeueAfter", poll.String())
 	return ctrl.Result{RequeueAfter: poll}, nil
 }
 
@@ -395,14 +395,20 @@ func (r *ShadowWorkloadReconciler) measure(
 		}
 		r.Metrics.MeasurementFailed(sw.Namespace, sw.Name, reason)
 		setDegraded(reasonPrometheusUnavailable, "%v", qerr)
-		log.Error(qerr, "Failed to query metrics backend", "prometheusURL", sw.Spec.Metrics.PrometheusURL)
+		// Backend URLs can embed environment-identifying endpoints; they stay
+		// out of log key-values entirely. The error itself is already
+		// sanitised upstream by the sources client.
+		log.Error(qerr, "Failed to query metrics backend")
 		r.Recorder.Eventf(sw, corev1.EventTypeWarning, reasonPrometheusUnavailable,
 			"Prometheus query failed: %v", qerr)
 		return
 	}
 	r.Metrics.ObservedMeasurement(sw.Namespace, sw.Name, cpu, mem)
 	r.Metrics.MeasurementSucceeded(sw.Namespace, sw.Name, time.Now())
-	log.Info("Measured bare-metal footprint", "cpuCores", cpu, "memoryBytes", mem, "seriesFound", found)
+	// Per-poll telemetry lives in the kube_symbiont_* metrics series; keep
+	// the verbose log for debugging only so a 30-second poll does not emit
+	// thousands of identical lines per day.
+	log.V(1).Info("Measured bare-metal footprint", "cpuCores", cpu, "memoryBytes", mem, "seriesFound", found)
 	*cpuOut, *memOut = cpu, mem
 }
 
