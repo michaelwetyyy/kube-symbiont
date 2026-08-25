@@ -221,6 +221,9 @@ func TestBuildPhantomPod(t *testing.T) {
 	if pod.Spec.PriorityClassName != BallastPriorityClassName {
 		t.Errorf("PriorityClassName = %q, want %q", pod.Spec.PriorityClassName, BallastPriorityClassName)
 	}
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Errorf("AutomountServiceAccountToken = %v, want explicit false (pause container needs no API token)", pod.Spec.AutomountServiceAccountToken)
+	}
 	if len(pod.Spec.Containers) != 1 {
 		t.Fatalf("containers = %d, want 1", len(pod.Spec.Containers))
 	}
