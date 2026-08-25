@@ -53,6 +53,11 @@ const dockerCgroupIDSelector = `id=~"/system.slice/docker-.*"`
 // re-validated here so generated queries can never embed arbitrary strings.
 var windowPattern = regexp.MustCompile(`^([0-9]+(\.[0-9]+)?(ms|s|m|h))+$`)
 
+// ErrMultiSample marks a query that resolved to more than one vector sample.
+// Callers classify it with errors.Is instead of parsing error text, keeping
+// failure reporting bounded and label-safe.
+var ErrMultiSample = errors.New("multi-sample result")
+
 // Resolve turns a validated ShadowWorkloadSpec into its PromQL pair.
 func Resolve(spec *symbiontv1alpha1.ShadowWorkloadSpec) (Queries, error) {
 	switch spec.Source.Type {
@@ -200,7 +205,8 @@ func (c *Client) Query(ctx context.Context, expr string) (float64, bool, error) 
 		return 0, false, nil
 	}
 	if len(payload.Data.Result) != 1 {
-		return 0, false, fmt.Errorf("prometheus query returned %d samples; aggregate to one", len(payload.Data.Result))
+		return 0, false, fmt.Errorf("%w: prometheus query returned %d samples; aggregate to one",
+			ErrMultiSample, len(payload.Data.Result))
 	}
 	raw := payload.Data.Result[0].Value[1]
 	str, ok := raw.(string)

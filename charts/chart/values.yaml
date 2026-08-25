@@ -169,6 +169,12 @@ certManager:
 ##
 prometheus:
   enabled: false
+  ## Extra labels for the ServiceMonitor, e.g. the selector label your
+  ## Prometheus operator matches on (kube-prometheus-stack users typically
+  ## set release: kube-prometheus-stack).
+  ##
+  # additionalLabels:
+  #   release: kube-prometheus-stack
 
 ## Network policies for controlling traffic flow.
 ## Enable to restrict ingress to the controller manager.

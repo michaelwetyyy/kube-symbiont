@@ -9,3 +9,24 @@ resources:
 #  - path: monitor_tls_patch.yaml
 #    target:
 #      kind: ServiceMonitor
+
+# The ServiceMonitor above is deliberately distribution-neutral: it carries
+# only kube-symbiont's own labels and never bakes in a specific operator's
+# selector (e.g. no hardcoded release= label). To adopt it with a monitoring
+# stack that requires one, layer your own kustomization over ../default with
+# this directory enabled ([PROMETHEUS] under config/default/kustomization.yaml)
+# and patch on whatever label your operator selects on, e.g. for
+# kube-prometheus-stack:
+#
+#   resources:
+#   - ../../default
+#   patches:
+#   - target:
+#       group: monitoring.coreos.com
+#       version: v1
+#       kind: ServiceMonitor
+#       name: kube-symbiont-controller-manager-metrics-monitor
+#     patch: |-
+#       - op: add
+#         path: /metadata/labels/release
+#         value: kube-prometheus-stack

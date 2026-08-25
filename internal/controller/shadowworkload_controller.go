@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -31,8 +32,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	symbiontv1alpha1 "github.com/michaelwetyyy/kube-symbiont/api/v1alpha1"
+	"github.com/michaelwetyyy/kube-symbiont/internal/metrics"
 	"github.com/michaelwetyyy/kube-symbiont/internal/shadow"
 	"github.com/michaelwetyyy/kube-symbiont/internal/sources"
 )
@@ -79,6 +82,11 @@ type ShadowWorkloadReconciler struct {
 	// QuerierFor builds a metrics querier for a Prometheus URL. Defaults to
 	// sources.NewClient; overridable for tests.
 	QuerierFor func(rawURL string) (MetricsQuerier, error)
+
+	// Metrics instruments the measure → clamp → resize loop on the manager's
+	// Prometheus registry. Nil-safe: every call is a no-op until
+	// SetupWithManager installs a recorder.
+	Metrics *metrics.Recorder
 }
 
 // +kubebuilder:rbac:groups=symbiont.tensorhost.com,resources=shadowworkloads,verbs=get;list;watch;update;patch
@@ -104,6 +112,11 @@ type ShadowWorkloadReconciler struct {
 func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var sw symbiontv1alpha1.ShadowWorkload
 	if err := r.Get(ctx, req.NamespacedName, &sw); err != nil {
+		if apierrors.IsNotFound(err) {
+			// The CR is gone: drop every series it owned so the registry
+			// never accumulates stale namespaces.
+			r.Metrics.RemoveShadowWorkload(req.Namespace, req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	log := logf.FromContext(ctx).WithValues("shadowWorkload", req.NamespacedName, "node", sw.Spec.Node)
@@ -211,6 +224,7 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				"cpu", desired.CPU.String(), "memory", desired.Memory.String())
 			r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonPhantomCreated,
 				"Created phantom Pod %s on node %q (cpu=%s memory=%s)", name, sw.Spec.Node, desired.CPU.String(), desired.Memory.String())
+			r.Metrics.ReservationUpdated(sw.Namespace, sw.Name)
 			pod = *fresh
 			phantomObserved = true
 			setReady(reasonPhantomCreated)
@@ -236,6 +250,7 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			if degradedReason == "" && shadow.DriftExceeds(current, desired, sw.Spec.Update.DeltaThresholdPercent) {
 				before := current
 				if rerr := r.resizePhantom(ctx, &pod, desired); rerr != nil {
+					r.Metrics.MeasurementFailed(sw.Namespace, sw.Name, metrics.FailureResizeRejected)
 					setDegraded(reasonResizeRejected, "in-place resize of %s rejected: %v", name, rerr)
 					log.Error(rerr, "In-place resize rejected", "pod", name)
 					r.Recorder.Eventf(&sw, corev1.EventTypeWarning, reasonResizeRejected,
@@ -252,6 +267,7 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 					sw.Status.LastResize = now
 					sw.Status.CurrentCPU = desired.CPU
 					sw.Status.CurrentMemory = desired.Memory
+					r.Metrics.ReservationUpdated(sw.Namespace, sw.Name)
 					setReady(reasonResized)
 				}
 			} else if degradedReason == "" {
@@ -271,6 +287,8 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		effective := shadow.CurrentPairOf(observedPod)
 		sw.Status.CurrentCPU = effective.CPU
 		sw.Status.CurrentMemory = effective.Memory
+		r.Metrics.SetReserved(sw.Namespace, sw.Name,
+			effective.CPU.AsApproximateFloat64(), effective.Memory.AsApproximateFloat64())
 	}
 
 	if degradedReason != "" {
@@ -314,11 +332,13 @@ func (r *ShadowWorkloadReconciler) measure(
 	log := logf.FromContext(ctx)
 	queries, err := sources.Resolve(&sw.Spec)
 	if err != nil {
+		r.Metrics.MeasurementFailed(sw.Namespace, sw.Name, metrics.FailureSourceMissing)
 		setDegraded(reasonSourceInvalid, "%v", err)
 		return
 	}
 	querier, err := r.QuerierFor(sw.Spec.Metrics.PrometheusURL)
 	if err != nil {
+		r.Metrics.MeasurementFailed(sw.Namespace, sw.Name, metrics.FailureSourceMissing)
 		setDegraded(reasonSourceInvalid, "metrics backend config: %v", err)
 		return
 	}
@@ -326,12 +346,19 @@ func (r *ShadowWorkloadReconciler) measure(
 	defer cancel()
 	cpu, mem, found, qerr := querier.QueryPair(qctx, queries)
 	if qerr != nil {
+		reason := metrics.FailurePrometheusUnavailable
+		if errors.Is(qerr, sources.ErrMultiSample) {
+			reason = metrics.FailureMultiSample
+		}
+		r.Metrics.MeasurementFailed(sw.Namespace, sw.Name, reason)
 		setDegraded(reasonPrometheusUnavailable, "%v", qerr)
 		log.Error(qerr, "Failed to query metrics backend", "prometheusURL", sw.Spec.Metrics.PrometheusURL)
 		r.Recorder.Eventf(sw, corev1.EventTypeWarning, reasonPrometheusUnavailable,
 			"Prometheus query failed: %v", qerr)
 		return
 	}
+	r.Metrics.ObservedMeasurement(sw.Namespace, sw.Name, cpu, mem)
+	r.Metrics.MeasurementSucceeded(sw.Namespace, sw.Name, time.Now())
 	log.Info("Measured bare-metal footprint", "cpuCores", cpu, "memoryBytes", mem, "seriesFound", found)
 	*cpuOut, *memOut = cpu, mem
 }
@@ -414,6 +441,15 @@ func (r *ShadowWorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.QuerierFor = func(rawURL string) (MetricsQuerier, error) {
 			return sources.NewClient(rawURL, queryTimeout)
 		}
+	}
+	if r.Metrics == nil {
+		r.Metrics = metrics.New()
+	}
+	// Serve the symbiont series from controller-runtime's metrics.Registry —
+	// the same registry the manager's metrics endpoint exposes — alongside,
+	// never duplicating, controller-runtime's own reconcile metrics.
+	if err := r.Metrics.Register(crmetrics.Registry); err != nil {
+		return fmt.Errorf("register shadow workload metrics: %w", err)
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&symbiontv1alpha1.ShadowWorkload{}).

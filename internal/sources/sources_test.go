@@ -18,6 +18,7 @@ package sources
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -271,5 +272,23 @@ func TestClientRejectsRedirectWithoutLeakingDestination(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), target.URL) || strings.Contains(err.Error(), "secret") {
 		t.Fatalf("redirect destination leaked into error: %v", err)
+	}
+}
+
+func TestMultiSampleClassifiesViaSentinel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"1"]},{"value":[0,"2"]}]}}`))
+	}))
+	defer srv.Close()
+	c, err := NewClient(srv.URL, 0)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	_, _, _, err = c.QueryPair(context.Background(), Queries{CPUCores: "cpu-multi", MemoryBytes: "mem-multi"})
+	if err == nil {
+		t.Fatal("multi-sample pair must fail")
+	}
+	if !errors.Is(err, ErrMultiSample) {
+		t.Fatalf("QueryPair error must wrap ErrMultiSample for bounded failure classification: %v", err)
 	}
 }
