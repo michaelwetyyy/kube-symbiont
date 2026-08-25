@@ -19,6 +19,12 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
+
+	zapr "github.com/go-logr/zapr"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -31,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	symbiontv1alpha1 "github.com/michaelwetyyy/kube-symbiont/api/v1alpha1"
@@ -581,3 +588,140 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(degraded.Reason).To(Equal("NodeTerminating"))
 	})
 })
+
+// loggingCtx carries the observer-backed logger for the hygiene specs.
+var loggingCtx context.Context
+
+var _ = Describe("Steady-state logging hygiene", func() {
+	const resourceName = "log-shadow"
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: "default"}
+
+	cleanup := func(obj client.Object) {
+		_ = k8sClient.Delete(ctx, obj, client.GracePeriodSeconds(0))
+		Eventually(func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(obj), obj))
+		}).Should(BeTrue())
+	}
+
+	var (
+		stub     *stubQuerier
+		observed *observer.ObservedLogs
+	)
+
+	BeforeEach(func() {
+		pc := &schedulingv1.PriorityClass{
+			ObjectMeta: metav1.ObjectMeta{Name: shadow.BallastPriorityClassName},
+			Value:      1000,
+		}
+		Expect(k8sClient.Create(ctx, pc)).To(Succeed())
+		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName}}
+		capacity := corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("32"),
+			corev1.ResourceMemory: resource.MustParse("64Gi"),
+			corev1.ResourcePods:   resource.MustParse("110"),
+		}
+		node.Status.Capacity = capacity
+		node.Status.Allocatable = capacity.DeepCopy()
+		node.Status.Conditions = []corev1.NodeCondition{{
+			Type:               corev1.NodeReady,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: metav1.Now(),
+		}}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		stub = &stubQuerier{cpu: 2, mem: 6 * 1024 * 1024 * 1024}
+		core, logs := observer.New(zapcore.InfoLevel)
+		observed = logs
+		logger := zapr.NewLogger(zap.New(core))
+		loggingCtx = logf.IntoContext(ctx, logger.WithName("logging-hygiene"))
+	})
+
+	AfterEach(func() {
+		sw := &symbiontv1alpha1.ShadowWorkload{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}
+		cleanup(sw)
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "shadow-" + key.Name, Namespace: key.Namespace}}
+		cleanup(pod)
+		cleanup(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName}})
+		cleanup(&schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: shadow.BallastPriorityClassName}})
+	})
+
+	reconcileUnderTest := func() error {
+		r := &ShadowWorkloadReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Recorder:  record.NewFakeRecorder(64),
+			APIReader: k8sClient,
+			QuerierFor: func(string) (MetricsQuerier, error) {
+				return stub, nil
+			},
+		}
+		_, err := r.Reconcile(loggingCtx, reconcile.Request{NamespacedName: key})
+		return err
+	}
+
+	infoCount := func(msg string) int {
+		n := 0
+		for _, e := range observed.All() {
+			if e.Level == zapcore.InfoLevel && e.Message == msg {
+				n++
+			}
+		}
+		return n
+	}
+
+	It("emits no per-poll Info lines for unchanged steady state", func() {
+		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
+		Expect(reconcileUnderTest()).To(Succeed())
+		Expect(reconcileUnderTest()).To(Succeed())
+		Expect(infoCount("Measured bare-metal footprint")).To(Equal(0))
+		Expect(infoCount("Reconciled")).To(Equal(0))
+	})
+
+	It("still reports accepted resizes at Info level", func() {
+		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
+		Expect(reconcileUnderTest()).To(Succeed())
+		stub.cpu = 4 // drift beyond deltaThresholdPercent forces a resize
+		Expect(reconcileUnderTest()).To(Succeed())
+		Expect(infoCount("Resized phantom Pod")).To(Equal(1))
+	})
+
+	It("keeps backend URLs out of failure log key-values", func() {
+		privateURL := "http://prometheus.monitoring.svc:9090"
+		spec := validShadowWorkload(resourceName)
+		spec.Spec.Metrics.PrometheusURL = privateURL
+		Expect(k8sClient.Create(ctx, spec)).To(Succeed())
+
+		r := &ShadowWorkloadReconciler{
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Recorder:  record.NewFakeRecorder(64),
+			APIReader: k8sClient,
+			QuerierFor: func(string) (MetricsQuerier, error) {
+				return failingQuerier{}, nil
+			},
+		}
+		_, err := r.Reconcile(loggingCtx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		var found *observer.LoggedEntry
+		for i := range observed.All() {
+			e := observed.All()[i]
+			if e.Level == zapcore.ErrorLevel && e.Message == "Failed to query metrics backend" {
+				found = &observed.All()[i]
+			}
+		}
+		Expect(found).NotTo(BeNil())
+		for _, kv := range found.Context {
+			Expect(kv.Key).NotTo(Equal("prometheusURL"))
+			Expect(fmt.Sprintf("%v", kv.Interface)).NotTo(ContainSubstring(privateURL))
+		}
+	})
+})
+
+// failingQuerier always fails so the Prometheus-unavailable path runs.
+type failingQuerier struct{}
+
+func (failingQuerier) QueryPair(_ context.Context, _ sources.Queries) (float64, float64, bool, error) {
+	return 0, 0, false, errors.New("prometheus query failed: connection refused")
+}
