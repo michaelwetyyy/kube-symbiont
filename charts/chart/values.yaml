@@ -169,6 +169,10 @@ certManager:
 ##
 prometheus:
   enabled: false
+  ## Also render a PrometheusRule with the recording rules and bounded alerts
+  ## (drift, staleness, failures, flapping). Requires prometheus-operator.
+  rule:
+    enabled: false
   ## Extra labels for the ServiceMonitor, e.g. the selector label your
   ## Prometheus operator matches on (kube-prometheus-stack users typically
   ## set release: kube-prometheus-stack).
