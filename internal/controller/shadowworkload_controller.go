@@ -48,6 +48,7 @@ const (
 	reasonWithinThreshold       = "WithinThreshold"
 	reasonPhantomCreated        = "PhantomCreated"
 	reasonPhantomRecreated      = "PhantomRecreated"
+	reasonPhantomAdopted        = "PhantomAdopted"
 	reasonResized               = "Resized"
 	reasonNodeMissing           = "NodeMissing"
 	reasonNodeNotReady          = "NodeNotReady"
@@ -218,7 +219,49 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				return ctrl.Result{}, fmt.Errorf("build phantom pod: %w", berr)
 			}
 			if cerr := r.Create(ctx, fresh); cerr != nil {
-				return ctrl.Result{}, fmt.Errorf("create phantom pod %s: %w", name, cerr)
+				if !apierrors.IsAlreadyExists(cerr) {
+					return ctrl.Result{}, fmt.Errorf("create phantom pod %s: %w", name, cerr)
+				}
+				// The scoped Pod informer only tracks pods carrying the
+				// managed-by label, so a same-name pod invisible to the cache
+				// exists at the API server. Verify through the uncached reader
+				// before deciding: foreign pods are reported as conflicts, and
+				// our own label-stripped phantoms are relabelled and adopted
+				// instead of crash-looping on Create.
+				var live corev1.Pod
+				gerr := r.APIReader.Get(ctx, key, &live)
+				if gerr != nil && !apierrors.IsNotFound(gerr) {
+					return ctrl.Result{}, fmt.Errorf("read existing phantom pod %s: %w", name, gerr)
+				}
+				if apierrors.IsNotFound(gerr) {
+					// The conflicting object vanished between Create and Get;
+					// retry cleanly on the next poll.
+					return ctrl.Result{RequeueAfter: poll}, nil
+				}
+				if ownedBySw(&live, &sw) {
+					if live.Labels == nil {
+						live.Labels = map[string]string{}
+					}
+					live.Labels[shadow.LabelManagedBy] = shadow.ManagedByValue
+					live.Labels[shadow.LabelShadowWorkload] = sw.Name
+					if uerr := r.Update(ctx, &live); uerr != nil {
+						if apierrors.IsConflict(uerr) {
+							return ctrl.Result{RequeueAfter: poll}, nil
+						}
+						return ctrl.Result{}, fmt.Errorf("relabel phantom pod %s: %w", name, uerr)
+					}
+					log.Info("Relabelled managed phantom Pod", "pod", name)
+					r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonPhantomAdopted,
+						"Relabelled phantom Pod %s so the scoped cache tracks it again", name)
+					pod = live
+					phantomObserved = true
+					setReady(reasonPhantomAdopted)
+				} else {
+					msg := fmt.Sprintf("pod %s exists without the managed-by label or controller owner reference; refusing to manage it", name)
+					setDegraded(reasonPhantomConflict, "%s", msg)
+					r.warnOnDegradedTransition(&sw, reasonPhantomConflict, msg)
+				}
+				break
 			}
 			log.Info("Created phantom Pod", "pod", name, "node", sw.Spec.Node,
 				"cpu", desired.CPU.String(), "memory", desired.Memory.String())

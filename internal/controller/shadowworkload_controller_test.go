@@ -581,3 +581,150 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(degraded.Reason).To(Equal("NodeTerminating"))
 	})
 })
+
+// labelFilteredClient simulates the manager's label-scoped Pod informer:
+// Gets for pods that lack the managed-by label behave as NotFound even
+// though the object still exists at the API server.
+type labelFilteredClient struct {
+	client.Client
+}
+
+func (c labelFilteredClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	err := c.Client.Get(ctx, key, obj, opts...)
+	if err != nil {
+		return err
+	}
+	if pod, ok := obj.(*corev1.Pod); ok &&
+		pod.Labels[shadow.LabelManagedBy] != shadow.ManagedByValue {
+		return apierrors.NewNotFound(corev1.Resource("pods"), key.Name)
+	}
+	return nil
+}
+
+var _ = Describe("Scoped Pod cache conflict fallback", func() {
+	const resourceName = "cache-shadow"
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: "default"}
+
+	cleanup := func(obj client.Object) {
+		_ = k8sClient.Delete(ctx, obj, client.GracePeriodSeconds(0))
+		Eventually(func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(obj), obj))
+		}).Should(BeTrue())
+	}
+
+	var stub *stubQuerier
+
+	BeforeEach(func() {
+		pc := &schedulingv1.PriorityClass{
+			ObjectMeta: metav1.ObjectMeta{Name: shadow.BallastPriorityClassName},
+			Value:      1000,
+		}
+		Expect(k8sClient.Create(ctx, pc)).To(Succeed())
+		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName}}
+		capacity := corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("32"),
+			corev1.ResourceMemory: resource.MustParse("64Gi"),
+			corev1.ResourcePods:   resource.MustParse("110"),
+		}
+		node.Status.Capacity = capacity
+		node.Status.Allocatable = capacity.DeepCopy()
+		node.Status.Conditions = []corev1.NodeCondition{{
+			Type:               corev1.NodeReady,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: metav1.Now(),
+		}}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		stub = &stubQuerier{cpu: 2, mem: 6 * 1024 * 1024 * 1024}
+	})
+
+	AfterEach(func() {
+		sw := &symbiontv1alpha1.ShadowWorkload{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}
+		cleanup(sw)
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "shadow-" + key.Name, Namespace: key.Namespace}}
+		cleanup(pod)
+		cleanup(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName}})
+		cleanup(&schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{Name: shadow.BallastPriorityClassName}})
+	})
+
+	newFilteredReconciler := func() *ShadowWorkloadReconciler {
+		return &ShadowWorkloadReconciler{
+			Client:    labelFilteredClient{Client: k8sClient},
+			Scheme:    k8sClient.Scheme(),
+			Recorder:  record.NewFakeRecorder(64),
+			APIReader: k8sClient,
+			QuerierFor: func(string) (MetricsQuerier, error) {
+				return stub, nil
+			},
+		}
+	}
+
+	It("still creates the phantom normally under the scoped cache", func() {
+		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
+		res, err := newFilteredReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter.String()).To(Equal("30s"))
+
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "shadow-" + resourceName, Namespace: key.Namespace}, pod)).To(Succeed())
+		Expect(pod.Labels[shadow.LabelManagedBy]).To(Equal(shadow.ManagedByValue))
+
+		updated := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, updated)).To(Succeed())
+		ready := meta.FindStatusCondition(updated.Status.Conditions, conditionReady)
+		Expect(ready).NotTo(BeNil())
+		Expect(ready.Reason).To(Equal(reasonPhantomCreated))
+	})
+
+	It("reports PhantomConflict for an unlabelled same-name pod instead of crash-looping", func() {
+		foreign := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "shadow-" + resourceName, Namespace: key.Namespace},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "squatter", Image: shadow.PhantomImage}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
+
+		_, err := newFilteredReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, updated)).To(Succeed())
+		degraded := meta.FindStatusCondition(updated.Status.Conditions, conditionDegraded)
+		Expect(degraded).NotTo(BeNil())
+		Expect(degraded.Reason).To(Equal(reasonPhantomConflict))
+		// The foreign pod is untouched: no relabel, no adoption.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "shadow-" + resourceName, Namespace: key.Namespace}, foreign)).To(Succeed())
+		Expect(foreign.OwnerReferences).To(BeEmpty())
+	})
+
+	It("relabels and adopts its own phantom whose managed-by label was stripped", func() {
+		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
+		r := newFilteredReconciler()
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		podKey := types.NamespacedName{Name: "shadow-" + resourceName, Namespace: key.Namespace}
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, podKey, pod)).To(Succeed())
+		delete(pod.Labels, shadow.LabelManagedBy)
+		delete(pod.Labels, shadow.LabelShadowWorkload)
+		Expect(k8sClient.Update(ctx, pod)).To(Succeed())
+
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, podKey, pod)).To(Succeed())
+		Expect(pod.Labels[shadow.LabelManagedBy]).To(Equal(shadow.ManagedByValue))
+		Expect(pod.Labels[shadow.LabelShadowWorkload]).To(Equal(resourceName))
+
+		updated := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, updated)).To(Succeed())
+		ready := meta.FindStatusCondition(updated.Status.Conditions, conditionReady)
+		Expect(ready).NotTo(BeNil())
+		Expect(ready.Reason).To(Equal(reasonPhantomAdopted))
+		Expect(updated.Status.PhantomPod).To(Equal(podKey.Name))
+	})
+})
