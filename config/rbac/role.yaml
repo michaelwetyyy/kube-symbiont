@@ -44,8 +44,6 @@ rules:
   resources:
   - shadowworkloads
   verbs:
-  - create
-  - delete
   - get
   - list
   - patch

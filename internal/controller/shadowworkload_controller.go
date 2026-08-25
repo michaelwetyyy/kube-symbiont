@@ -81,7 +81,7 @@ type ShadowWorkloadReconciler struct {
 	QuerierFor func(rawURL string) (MetricsQuerier, error)
 }
 
-// +kubebuilder:rbac:groups=symbiont.tensorhost.com,resources=shadowworkloads,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=symbiont.tensorhost.com,resources=shadowworkloads,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=symbiont.tensorhost.com,resources=shadowworkloads/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=pods/resize,verbs=patch
