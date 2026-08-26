@@ -36,6 +36,22 @@ def run(*args: str) -> str:
     return result.stdout
 
 
+def require_failure(expected: str, *args: str) -> None:
+    executable = shutil.which(args[0])
+    if executable is None:
+        fail(f"required offline renderer not found: {args[0]}")
+    result = subprocess.run(
+        [executable, *args[1:]],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    output = result.stdout + result.stderr
+    if result.returncode == 0 or expected not in output:
+        fail(f"{' '.join(args)} did not fail with expected message {expected!r}")
+
+
 def validate_dashboard() -> None:
     dashboard = json.loads(DASHBOARD.read_text())
     variables = dashboard["templating"]["list"]
@@ -108,6 +124,17 @@ def validate_kustomize() -> None:
 
 def validate_helm() -> None:
     run("helm", "lint", "charts/chart")
+    require_failure(
+        "prometheus.enabled=true requires metrics.enabled=true",
+        "helm",
+        "template",
+        "invalid-monitoring",
+        "charts/chart",
+        "--set",
+        "prometheus.enabled=true",
+        "--set",
+        "metrics.enabled=false",
+    )
     rendered = run(
         "helm",
         "template",
@@ -121,6 +148,12 @@ def validate_helm() -> None:
         "prometheus.rule.enabled=true",
         "--set",
         "prometheus.additionalLabels.release=kube-prometheus-stack",
+        "--set",
+        "metrics.tls.existingSecret=metrics-server-cert",
+        "--set",
+        "prometheus.scraperServiceAccount.name=kube-prometheus-stack-prometheus",
+        "--set",
+        "prometheus.scraperServiceAccount.namespace=monitoring",
     )
     for item in (
         "kind: ServiceMonitor",
@@ -128,6 +161,10 @@ def validate_helm() -> None:
         "KubeSymbiontDriftBelowReservationMemory",
         "KubeSymbiontMetricsTargetDown",
         "release: kube-prometheus-stack",
+        "secretName: metrics-server-cert",
+        "--metrics-cert-path=/tmp/k8s-metrics-server/metrics-certs",
+        "name: kube-prometheus-stack-prometheus",
+        "namespace: monitoring",
     ):
         if item not in rendered:
             fail(f"Helm monitoring render is missing {item}")

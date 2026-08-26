@@ -78,6 +78,8 @@ spec:
         - --metrics-bind-address=:{{ .Values.metrics.port }}
         {{- if not .Values.metrics.secure }}
         - --metrics-secure=false
+        {{- else if .Values.metrics.tls.existingSecret }}
+        - --metrics-cert-path=/tmp/k8s-metrics-server/metrics-certs
         {{- end }}
         {{- else }}
         # Bind to :0 to disable the controller-runtime managed metrics server
@@ -123,9 +125,14 @@ spec:
           {}
           {{- end }}
         volumeMounts:
+          {{- if and .Values.metrics.secure .Values.metrics.tls.existingSecret }}
+          - mountPath: /tmp/k8s-metrics-server/metrics-certs
+            name: metrics-certs
+            readOnly: true
+          {{- end }}
           {{- if .Values.manager.extraVolumeMounts }}
           {{- toYaml .Values.manager.extraVolumeMounts | nindent 10 }}
-          {{- else }}
+          {{- else if not (and .Values.metrics.secure .Values.metrics.tls.existingSecret) }}
           []
           {{- end }}
       securityContext:
@@ -139,9 +146,22 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.manager.terminationGracePeriodSeconds }}
       {{- end }}
       volumes:
+        {{- if and .Values.metrics.secure .Values.metrics.tls.existingSecret }}
+        - name: metrics-certs
+          secret:
+            optional: false
+            secretName: {{ .Values.metrics.tls.existingSecret }}
+            items:
+            - key: {{ .Values.metrics.tls.caKey }}
+              path: ca.crt
+            - key: {{ .Values.metrics.tls.certKey }}
+              path: tls.crt
+            - key: {{ .Values.metrics.tls.keyKey }}
+              path: tls.key
+        {{- end }}
         {{- if .Values.manager.extraVolumes }}
         {{- toYaml .Values.manager.extraVolumes | nindent 8 }}
-        {{- else }}
+        {{- else if not (and .Values.metrics.secure .Values.metrics.tls.existingSecret) }}
         []
         {{- end }}
 {{- end }}

@@ -1,13 +1,6 @@
 apiVersion: rbac.authorization.k8s.io/v1
-{{- if .Values.rbac.namespaced }}
-kind: Role
-{{- else }}
 kind: ClusterRole
-{{- end }}
 metadata:
-{{- if .Values.rbac.namespaced }}
-  namespace: {{ .Release.Namespace }}
-{{- end }}
   name: {{ include "kube-symbiont.resourceName" (dict "suffix" "manager-role" "context" $) }}
 rules:
 - apiGroups:
@@ -40,12 +33,16 @@ rules:
   - create
   - patch
 - apiGroups:
+  - scheduling.k8s.io
+  resources:
+  - priorityclasses
+  verbs:
+  - get
+- apiGroups:
   - symbiont.tensorhost.com
   resources:
   - shadowworkloads
   verbs:
-  - create
-  - delete
   - get
   - list
   - patch
