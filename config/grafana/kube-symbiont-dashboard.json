@@ -31,7 +31,7 @@
         },
         "query": {
           "query": "label_values(kube_symbiont_shadowworkload_reserved_cpu_cores, namespace)",
-          "refId": "StandardVariableQuery"
+          "refId": "NamespaceVariableQuery"
         },
         "includeAll": true,
         "multi": true,
@@ -46,8 +46,8 @@
           "uid": "${datasource}"
         },
         "query": {
-          "query": "label_values(kube_symbiont_shadowworkload_reserved_cpu_cores, name)",
-          "refId": "StandardVariableQuery"
+          "query": "label_values(kube_symbiont_shadowworkload_reserved_cpu_cores{namespace=~\"$namespace\"}, name)",
+          "refId": "NameVariableQuery"
         },
         "includeAll": true,
         "multi": true,
@@ -97,7 +97,7 @@
             "uid": "${datasource}"
           },
           "expr": "kube_symbiont_shadowworkload_measured_cpu_cores{namespace=~\"$namespace\",name=~\"$name\"}",
-          "legendFormat": "{{name}} measured (consumption)",
+          "legendFormat": "{{namespace}}/{{name}} measured (consumption)",
           "refId": "A"
         },
         {
@@ -106,15 +106,15 @@
             "uid": "${datasource}"
           },
           "expr": "kube_symbiont_shadowworkload_reserved_cpu_cores{namespace=~\"$namespace\",name=~\"$name\"}",
-          "legendFormat": "{{name}} reserved (scheduler ledger)",
-          "refId": "A"
+          "legendFormat": "{{namespace}}/{{name}} reserved (scheduler ledger)",
+          "refId": "B"
         }
       ]
     },
     {
       "id": 2,
       "type": "timeseries",
-      "title": "Measured bare-metal consumption vs scheduler reservation (memory bytes)",
+      "title": "Measured bare-metal consumption vs scheduler reservation (memory)",
       "description": "",
       "gridPos": {
         "h": 9,
@@ -148,7 +148,7 @@
             "uid": "${datasource}"
           },
           "expr": "kube_symbiont_shadowworkload_measured_memory_bytes{namespace=~\"$namespace\",name=~\"$name\"}",
-          "legendFormat": "{{name}} measured (consumption)",
+          "legendFormat": "{{namespace}}/{{name}} measured (consumption)",
           "refId": "A"
         },
         {
@@ -157,15 +157,15 @@
             "uid": "${datasource}"
           },
           "expr": "kube_symbiont_shadowworkload_reserved_memory_bytes{namespace=~\"$namespace\",name=~\"$name\"}",
-          "legendFormat": "{{name}} reserved (scheduler ledger)",
-          "refId": "A"
+          "legendFormat": "{{namespace}}/{{name}} reserved (scheduler ledger)",
+          "refId": "B"
         }
       ]
     },
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Reservation drift minus consumption (CPU cores)",
+      "title": "Scheduler reservation minus measured consumption (CPU)",
       "description": "Persistently below zero means the workload outgrew spec.update.ceiling.",
       "gridPos": {
         "h": 8,
@@ -179,7 +179,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "cores"
         },
         "overrides": []
       },
@@ -199,7 +199,7 @@
             "uid": "${datasource}"
           },
           "expr": "kube_symbiont:shadowworkload_reservation_drift_cpu_cores{namespace=~\"$namespace\",name=~\"$name\"}",
-          "legendFormat": "{{name}}",
+          "legendFormat": "{{namespace}}/{{name}} drift",
           "refId": "A"
         }
       ]
@@ -207,7 +207,7 @@
     {
       "id": 4,
       "type": "timeseries",
-      "title": "Reservation drift minus consumption (memory bytes)",
+      "title": "Scheduler reservation minus measured consumption (memory)",
       "description": "",
       "gridPos": {
         "h": 8,
@@ -241,7 +241,7 @@
             "uid": "${datasource}"
           },
           "expr": "kube_symbiont:shadowworkload_reservation_drift_memory_bytes{namespace=~\"$namespace\",name=~\"$name\"}",
-          "legendFormat": "{{name}}",
+          "legendFormat": "{{namespace}}/{{name}} drift",
           "refId": "A"
         }
       ]
@@ -283,7 +283,7 @@
             "uid": "${datasource}"
           },
           "expr": "kube_symbiont:shadowworkload_measurement_age_seconds{namespace=~\"$namespace\",name=~\"$name\"}",
-          "legendFormat": "{{name}}",
+          "legendFormat": "{{namespace}}/{{name}}",
           "refId": "A"
         }
       ]
@@ -291,7 +291,7 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "Measurement failures (10m increase) and reservation updates (15m changes)",
+      "title": "Recent failures and accepted reservation updates",
       "description": "",
       "gridPos": {
         "h": 7,
@@ -325,7 +325,7 @@
             "uid": "${datasource}"
           },
           "expr": "increase(kube_symbiont_shadowworkload_measurement_failures_total{namespace=~\"$namespace\",name=~\"$name\"}[10m])",
-          "legendFormat": "{{name}} {{reason}} failures (10m)",
+          "legendFormat": "{{namespace}}/{{name}} {{reason}} failures (10m)",
           "refId": "A"
         },
         {
@@ -333,8 +333,55 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "changes(kube_symbiont_shadowworkload_reservation_updates_total{namespace=~\"$namespace\",name=~\"$name\"}[15m])",
-          "legendFormat": "{{name}} updates (15m changes)",
+          "expr": "increase(kube_symbiont_shadowworkload_reservation_updates_total{namespace=~\"$namespace\",name=~\"$name\"}[15m])",
+          "legendFormat": "{{namespace}}/{{name}} accepted updates (15m)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Controller metrics scrape target",
+      "description": "One means Prometheus can scrape the kube-symbiont controller metrics Service.",
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "up{namespace=~\"$namespace\",service=\"kube-symbiont-controller-manager-metrics-service\"}",
+          "legendFormat": "{{namespace}} controller metrics",
           "refId": "A"
         }
       ]

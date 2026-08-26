@@ -33,23 +33,23 @@ spec:
     interval: 30s
     rules:
     - alert: KubeSymbiontMeasurementStale
-      expr: kube_symbiont:shadowworkload_measurement_age_seconds > 90
-      for: 2m
+      expr: kube_symbiont:shadowworkload_measurement_age_seconds > 120
+      for: 1m
       labels:
         severity: warning
       annotations:
-        summary: ShadowWorkload {{"{{ $labels.namespace }}"}}/{{"{{ $labels.name }}"}} has not measured for over 90s
-        description: No successful measurement advanced the last-success timestamp for three poll intervals; check backend reachability. The phantom keeps its last truthful reservation.
-    - alert: KubeSymbiontMeasurementFailing
+        summary: ShadowWorkload {{"{{ $labels.namespace }}"}}/{{"{{ $labels.name }}"}} has no recent successful measurement
+        description: With the documented 30s poll profile, the last successful measurement is more than four poll intervals old and remained so for another minute. The phantom keeps its last truthful reservation; check backend reachability and the ShadowWorkload condition.
+    - alert: KubeSymbiontReconcileFailures
       expr: increase(kube_symbiont_shadowworkload_measurement_failures_total[10m]) > 0
       for: 1m
       labels:
         severity: warning
       annotations:
-        summary: ShadowWorkload {{"{{ $labels.namespace }}"}}/{{"{{ $labels.name }}"}} measurements are failing
-        description: The failure counter increased in the last ten minutes under a bounded reason.
+        summary: ShadowWorkload {{"{{ $labels.namespace }}"}}/{{"{{ $labels.name }}"}} reported {{"{{ $labels.reason }}"}}
+        description: A measurement or reservation-update failure occurred in the last ten minutes; inspect the bounded reason label.
     - alert: KubeSymbiontReservationFlapping
-      expr: changes(kube_symbiont_shadowworkload_reservation_updates_total[15m]) > 6
+      expr: increase(kube_symbiont_shadowworkload_reservation_updates_total[15m]) > 6
       for: 5m
       labels:
         severity: warning
@@ -63,5 +63,21 @@ spec:
         severity: info
       annotations:
         summary: Measured CPU exceeds the phantom reservation on {{"{{ $labels.namespace }}"}}/{{"{{ $labels.name }}"}}
-        description: Real consumption exceeded the reservation for fifteen minutes, typically a ceiling clamp below actual demand.
+        description: Real consumption exceeded the reservation for fifteen minutes; inspect the condition for a ceiling clamp, measurement-to-resize delay or rejected update.
+    - alert: KubeSymbiontDriftBelowReservationMemory
+      expr: kube_symbiont:shadowworkload_reservation_drift_memory_bytes < -268435456
+      for: 15m
+      labels:
+        severity: info
+      annotations:
+        summary: Measured memory exceeds the phantom reservation on {{"{{ $labels.namespace }}"}}/{{"{{ $labels.name }}"}}
+        description: Real memory consumption exceeded the reservation by more than 256 MiB for fifteen minutes; inspect the condition before changing bounds.
+    - alert: KubeSymbiontMetricsTargetDown
+      expr: absent(up{namespace={{ .Release.Namespace | quote }},service={{ include "kube-symbiont.resourceName" (dict "suffix" "controller-manager-metrics-service" "context" $) | quote }}} == 1)
+      for: 2m
+      labels:
+        severity: warning
+      annotations:
+        summary: kube-symbiont metrics target is unavailable
+        description: Prometheus has not observed a healthy kube-symbiont controller metrics target for two minutes; check monitor selection, TLS/authentication and controller readiness.
 {{- end }}
