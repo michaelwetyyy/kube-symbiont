@@ -3,8 +3,8 @@ name: kube-symbiont
 description: A Helm chart to distribute kube-symbiont
 type: application
 
-version: 0.2.0-rc.1
-appVersion: "v0.2.0-rc.1"
+version: 0.2.0-rc.2
+appVersion: "v0.2.0-rc.2"
 
 keywords:
   - kubernetes

@@ -89,9 +89,7 @@ func main() {
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.BoolVar(&showVersion, "version", false, "Print version and source revision, then exit.")
-	opts := zap.Options{
-		Development: true,
-	}
+	opts := defaultZapOptions()
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	if showVersion {
@@ -230,4 +228,10 @@ func main() {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
+}
+
+// defaultZapOptions keeps production deployments at Info level. Operators can
+// explicitly enable development logging with the standard --zap-devel flag.
+func defaultZapOptions() zap.Options {
+	return zap.Options{Development: false}
 }
