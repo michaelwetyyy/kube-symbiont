@@ -285,12 +285,27 @@ install-helm: ## Install the latest version of Helm.
 	}
 
 .PHONY: helm-deploy
+helm-deploy: export IMG := $(IMG)
 helm-deploy: install-helm ## Deploy manager to the K8s cluster via Helm. Specify an image with IMG.
+	@image_reference="$${IMG-}"; \
+	if [[ "$$image_reference" =~ ^([^@[:space:]]+)@(sha256:[0-9a-f]{64})$$ ]]; then \
+		image_repository="$${BASH_REMATCH[1]}@$${BASH_REMATCH[2]}"; \
+		image_args=(--set-string "manager.image.repository=$$image_repository"); \
+	elif [[ "$$image_reference" =~ ^([^@[:space:]]+):([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})$$ ]]; then \
+		image_repository="$${BASH_REMATCH[1]}"; \
+		image_tag="$${BASH_REMATCH[2]}"; \
+		image_args=( \
+			--set-string "manager.image.repository=$$image_repository" \
+			--set-string "manager.image.tag=$$image_tag" \
+		); \
+	else \
+		echo "IMG must be repository:tag or repository@sha256:<64 lowercase hex characters>" >&2; \
+		exit 1; \
+	fi; \
 	$(HELM) upgrade --install $(HELM_RELEASE) $(HELM_CHART_DIR) \
 		--namespace $(HELM_NAMESPACE) \
 		--create-namespace \
-		--set manager.image.repository=$${IMG%:*} \
-		--set manager.image.tag=$${IMG##*:} \
+		"$${image_args[@]}" \
 		--wait \
 		--timeout 5m \
 		$(HELM_EXTRA_ARGS)

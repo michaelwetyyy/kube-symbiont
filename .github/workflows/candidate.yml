@@ -4,15 +4,25 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: Immutable prerelease image tag (for example, v0.1.0-rc.1)
+        description: Immutable prerelease image tag (for example, v0.2.0-rc.1)
+        required: true
+        type: string
+      expected_sha:
+        description: Exact 40-character commit SHA expected at origin/main
         required: true
         type: string
 
 permissions: {}
 
+# Candidate and stable publication share this lock. A running publication is
+# never cancelled midway through registry promotion.
+concurrency:
+  group: kube-symbiont-image-publication
+  cancel-in-progress: false
+
 jobs:
   candidate:
-    name: Build, scan, and attest candidate
+    name: Gate, build, scan, attest, and promote candidate
     runs-on: ubuntu-latest
     permissions:
       attestations: write
@@ -22,13 +32,50 @@ jobs:
     env:
       IMAGE: ghcr.io/michaelwetyyy/kube-symbiont
     steps:
-      - name: Validate candidate tag
-        run: '[[ "${{ inputs.image_tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]'
+      - name: Validate dispatch inputs
+        env:
+          CANDIDATE_TAG: ${{ inputs.image_tag }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        shell: bash
+        run: |
+          [[ "$CANDIDATE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
 
-      - name: Clone the code
+      - name: Clone the exact candidate source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          fetch-depth: 0
           persist-credentials: false
+          ref: ${{ inputs.expected_sha }}
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Verify exact source and repository gates
+        env:
+          CANDIDATE_TAG: ${{ inputs.image_tag }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git fetch --no-tags origin \
+            '+refs/heads/main:refs/remotes/origin/main'
+          test "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 -B hack/verify_release.py --kind candidate --tag "$CANDIDATE_TAG"
+          python3 -B -m unittest hack/test_verify_release.py
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+          make test
+          make lint-config
+          make lint
+          make verify-installer
+          helm lint charts/chart
+          python3 -B hack/verify-monitoring.py
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -40,21 +87,41 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push candidate
+      - name: Reject an existing immutable candidate tag
+        env:
+          CANDIDATE_TAG: ${{ inputs.image_tag }}
+        shell: bash
+        run: |
+          target="${IMAGE}:${CANDIDATE_TAG}"
+          if output="$(docker buildx imagetools inspect "$target" 2>&1)"; then
+            echo "Refusing to replace existing candidate tag: $target" >&2
+            exit 1
+          fi
+          if [[ "$output" != *"not found"* && "$output" != *"manifest unknown"* ]]; then
+            echo "Could not prove candidate tag is absent: $target" >&2
+            printf '%s\n' "$output" >&2
+            exit 1
+          fi
+
+      # Push by digest only. The requested candidate tag remains absent until
+      # the exact multi-platform digest has passed the vulnerability gate.
+      - name: Build untagged candidate digest
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        env:
+          CANDIDATE_TAG: ${{ inputs.image_tag }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ env.IMAGE }}:${{ inputs.image_tag }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
-            VERSION=${{ inputs.image_tag }}
-            VCS_REF=${{ github.sha }}
+            VERSION=${{ env.CANDIDATE_TAG }}
+            VCS_REF=${{ env.EXPECTED_SHA }}
           provenance: mode=max
           sbom: true
 
-      - name: Scan published digest
+      - name: Scan candidate digest
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
@@ -69,3 +136,25 @@ jobs:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+
+      - name: Promote scanned digest to immutable candidate tag
+        env:
+          CANDIDATE_TAG: ${{ inputs.image_tag }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          target="${IMAGE}:${CANDIDATE_TAG}"
+          if output="$(docker buildx imagetools inspect "$target" 2>&1)"; then
+            echo "Candidate tag appeared during the run; refusing collision: $target" >&2
+            exit 1
+          fi
+          if [[ "$output" != *"not found"* && "$output" != *"manifest unknown"* ]]; then
+            echo "Could not prove candidate tag is still absent: $target" >&2
+            printf '%s\n' "$output" >&2
+            exit 1
+          fi
+          docker buildx imagetools create \
+            --tag "$target" \
+            "${IMAGE}@${IMAGE_DIGEST}"
+          published_digest="$(docker buildx imagetools inspect "$target" | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"
+          test "$published_digest" = "$IMAGE_DIGEST"
