@@ -1,0 +1,390 @@
+{
+  "uid": "kube-symbiont-overview",
+  "title": "kube-symbiont / ShadowWorkload overview",
+  "tags": [
+    "kube-symbiont"
+  ],
+  "schemaVersion": 39,
+  "editable": true,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Datasource",
+        "current": {},
+        "options": []
+      },
+      {
+        "name": "namespace",
+        "type": "query",
+        "label": "Namespace",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(kube_symbiont_shadowworkload_reserved_cpu_cores, namespace)",
+          "refId": "NamespaceVariableQuery"
+        },
+        "includeAll": true,
+        "multi": true,
+        "current": {}
+      },
+      {
+        "name": "name",
+        "type": "query",
+        "label": "ShadowWorkload",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(kube_symbiont_shadowworkload_reserved_cpu_cores{namespace=~\"$namespace\"}, name)",
+          "refId": "NameVariableQuery"
+        },
+        "includeAll": true,
+        "multi": true,
+        "current": {}
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Measured bare-metal consumption vs scheduler reservation (CPU cores)",
+      "description": "Consumption is the real measured footprint; reservation is what the phantom subtracts from allocatable.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cores"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kube_symbiont_shadowworkload_measured_cpu_cores{namespace=~\"$namespace\",name=~\"$name\"}",
+          "legendFormat": "{{namespace}}/{{name}} measured (consumption)",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kube_symbiont_shadowworkload_reserved_cpu_cores{namespace=~\"$namespace\",name=~\"$name\"}",
+          "legendFormat": "{{namespace}}/{{name}} reserved (scheduler ledger)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Measured bare-metal consumption vs scheduler reservation (memory)",
+      "description": "",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kube_symbiont_shadowworkload_measured_memory_bytes{namespace=~\"$namespace\",name=~\"$name\"}",
+          "legendFormat": "{{namespace}}/{{name}} measured (consumption)",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kube_symbiont_shadowworkload_reserved_memory_bytes{namespace=~\"$namespace\",name=~\"$name\"}",
+          "legendFormat": "{{namespace}}/{{name}} reserved (scheduler ledger)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Scheduler reservation minus measured consumption (CPU)",
+      "description": "Persistently below zero means the workload outgrew spec.update.ceiling.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cores"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kube_symbiont:shadowworkload_reservation_drift_cpu_cores{namespace=~\"$namespace\",name=~\"$name\"}",
+          "legendFormat": "{{namespace}}/{{name}} drift",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Scheduler reservation minus measured consumption (memory)",
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kube_symbiont:shadowworkload_reservation_drift_memory_bytes{namespace=~\"$namespace\",name=~\"$name\"}",
+          "legendFormat": "{{namespace}}/{{name}} drift",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Measurement age (seconds since last success)",
+      "description": "",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 17
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "kube_symbiont:shadowworkload_measurement_age_seconds{namespace=~\"$namespace\",name=~\"$name\"}",
+          "legendFormat": "{{namespace}}/{{name}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Recent failures and accepted reservation updates",
+      "description": "",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 17
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "increase(kube_symbiont_shadowworkload_measurement_failures_total{namespace=~\"$namespace\",name=~\"$name\"}[10m])",
+          "legendFormat": "{{namespace}}/{{name}} {{reason}} failures (10m)",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "increase(kube_symbiont_shadowworkload_reservation_updates_total{namespace=~\"$namespace\",name=~\"$name\"}[15m])",
+          "legendFormat": "{{namespace}}/{{name}} accepted updates (15m)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Controller metrics scrape target",
+      "description": "One means Prometheus can scrape the kube-symbiont controller metrics Service.",
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "up{namespace=~\"$namespace\",service=\"kube-symbiont-controller-manager-metrics-service\"}",
+          "legendFormat": "{{namespace}} controller metrics",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

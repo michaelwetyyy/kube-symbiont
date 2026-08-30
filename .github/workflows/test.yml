@@ -27,6 +27,7 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
+          python3 -B -m unittest hack/test_verify_release.py
           make test
           make verify-installer
           git diff --exit-code

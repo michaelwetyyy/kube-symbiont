@@ -1,0 +1,83 @@
+{{- if and .Values.prometheus.enabled .Values.prometheus.rule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/name: {{ include "kube-symbiont.name" . }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    control-plane: controller-manager
+    {{- with .Values.prometheus.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  name: {{ include "kube-symbiont.resourceName" (dict "suffix" "controller-manager-rules" "context" $) }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  groups:
+  - name: kube-symbiont.shadowworkload.recording
+    interval: 30s
+    rules:
+    - record: kube_symbiont:shadowworkload_reservation_drift_cpu_cores
+      expr: |
+        kube_symbiont_shadowworkload_reserved_cpu_cores
+        - kube_symbiont_shadowworkload_measured_cpu_cores
+    - record: kube_symbiont:shadowworkload_reservation_drift_memory_bytes
+      expr: |
+        kube_symbiont_shadowworkload_reserved_memory_bytes
+        - kube_symbiont_shadowworkload_measured_memory_bytes
+    - record: kube_symbiont:shadowworkload_measurement_age_seconds
+      expr: |
+        time() - kube_symbiont_shadowworkload_last_successful_measurement_timestamp_seconds
+  - name: kube-symbiont.shadowworkload.alerts
+    interval: 30s
+    rules:
+    - alert: KubeSymbiontMeasurementStale
+      expr: kube_symbiont:shadowworkload_measurement_age_seconds > 120
+      for: 1m
+      labels:
+        severity: warning
+      annotations:
+        summary: ShadowWorkload {{"{{ $labels.namespace }}"}}/{{"{{ $labels.name }}"}} has no recent successful measurement
+        description: With the documented 30s poll profile, the last successful measurement is more than four poll intervals old and remained so for another minute. The phantom keeps its last truthful reservation; check backend reachability and the ShadowWorkload condition.
+    - alert: KubeSymbiontReconcileFailures
+      expr: increase(kube_symbiont_shadowworkload_measurement_failures_total[10m]) > 0
+      for: 1m
+      labels:
+        severity: warning
+      annotations:
+        summary: ShadowWorkload {{"{{ $labels.namespace }}"}}/{{"{{ $labels.name }}"}} reported {{"{{ $labels.reason }}"}}
+        description: A measurement or reservation-update failure occurred in the last ten minutes; inspect the bounded reason label.
+    - alert: KubeSymbiontReservationFlapping
+      expr: increase(kube_symbiont_shadowworkload_reservation_updates_total[15m]) > 6
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: ShadowWorkload {{"{{ $labels.namespace }}"}}/{{"{{ $labels.name }}"}} reservation is flapping
+        description: More than six accepted reservation mutations within fifteen minutes suggests deltaThresholdPercent is too low.
+    - alert: KubeSymbiontDriftBelowReservationCPU
+      expr: kube_symbiont:shadowworkload_reservation_drift_cpu_cores < -0.25
+      for: 15m
+      labels:
+        severity: info
+      annotations:
+        summary: Measured CPU exceeds the phantom reservation on {{"{{ $labels.namespace }}"}}/{{"{{ $labels.name }}"}}
+        description: Real consumption exceeded the reservation for fifteen minutes; inspect the condition for a ceiling clamp, measurement-to-resize delay or rejected update.
+    - alert: KubeSymbiontDriftBelowReservationMemory
+      expr: kube_symbiont:shadowworkload_reservation_drift_memory_bytes < -268435456
+      for: 15m
+      labels:
+        severity: info
+      annotations:
+        summary: Measured memory exceeds the phantom reservation on {{"{{ $labels.namespace }}"}}/{{"{{ $labels.name }}"}}
+        description: Real memory consumption exceeded the reservation by more than 256 MiB for fifteen minutes; inspect the condition before changing bounds.
+    - alert: KubeSymbiontMetricsTargetDown
+      expr: absent(up{namespace={{ .Release.Namespace | quote }},service={{ include "kube-symbiont.resourceName" (dict "suffix" "controller-manager-metrics-service" "context" $) | quote }}} == 1)
+      for: 2m
+      labels:
+        severity: warning
+      annotations:
+        summary: kube-symbiont metrics target is unavailable
+        description: Prometheus has not observed a healthy kube-symbiont controller metrics target for two minutes; check monitor selection, TLS/authentication and controller readiness.
+{{- end }}

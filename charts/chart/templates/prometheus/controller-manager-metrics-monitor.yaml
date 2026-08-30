@@ -1,4 +1,13 @@
 {{- if .Values.prometheus.enabled }}
+{{- if not .Values.metrics.enabled }}
+{{- fail "prometheus.enabled=true requires metrics.enabled=true" }}
+{{- end }}
+{{- if and .Values.metrics.secure (empty .Values.metrics.tls.existingSecret) (not .Values.prometheus.allowInsecureTLS) }}
+{{- fail "secure Prometheus scraping requires metrics.tls.existingSecret; set prometheus.allowInsecureTLS=true only for an explicitly accepted development-only scrape path" }}
+{{- end }}
+{{- if and .Values.metrics.secure (or (empty .Values.prometheus.scraperServiceAccount.name) (empty .Values.prometheus.scraperServiceAccount.namespace)) }}
+{{- fail "secure Prometheus scraping requires prometheus.scraperServiceAccount.name and namespace so /metrics authorization is explicit" }}
+{{- end }}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -24,18 +33,11 @@ spec:
     {{- if .Values.metrics.secure }}
     tlsConfig:
       serverName: {{ include "kube-symbiont.resourceName" (dict "suffix" "controller-manager-metrics-service" "context" $) }}.{{ .Release.Namespace }}.svc
-      {{- if .Values.certManager.enabled }}
+      {{- if .Values.metrics.tls.existingSecret }}
       ca:
         secret:
-          name: metrics-server-cert
-          key: ca.crt
-      cert:
-        secret:
-          name: metrics-server-cert
-          key: tls.crt
-      keySecret:
-        name: metrics-server-cert
-        key: tls.key
+          name: {{ .Values.metrics.tls.existingSecret }}
+          key: {{ .Values.metrics.tls.caKey }}
       {{- else }}
       insecureSkipVerify: true
       {{- end }}

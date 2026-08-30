@@ -199,7 +199,7 @@ func (c *Client) Query(ctx context.Context, expr string) (float64, bool, error) 
 		return 0, false, errors.New("prometheus query returned an error status")
 	}
 	if payload.Data.ResultType != "vector" {
-		return 0, false, fmt.Errorf("unexpected prometheus result type %q; want vector", payload.Data.ResultType)
+		return 0, false, errors.New("unexpected prometheus result type; want vector")
 	}
 	if len(payload.Data.Result) == 0 {
 		return 0, false, nil
@@ -248,7 +248,7 @@ func parseSample(s string) (float64, error) {
 	}
 	v, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		return 0, fmt.Errorf("parse sample %q: %w", s, err)
+		return 0, errors.New("prometheus sample is not numeric")
 	}
 	return v, nil
 }

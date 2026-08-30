@@ -89,6 +89,15 @@ helm upgrade --install kube-symbiont ./charts/chart \
   --namespace kube-symbiont-system --create-namespace
 ```
 
+The manager always needs a minimal ClusterRole: ShadowWorkloads are namespaced,
+but their node-eligibility and ballast-priority gates read cluster-scoped Nodes
+and PriorityClasses. `rbac.namespaced` therefore scopes only the optional
+admin/editor/viewer helper roles, not the manager. Enabling the ServiceMonitor
+with secure metrics also requires a Secret containing verified TLS material
+(`metrics.tls.existingSecret=...`);
+the chart fails closed unless the development-only
+`prometheus.allowInsecureTLS=true` override is explicitly accepted.
+
 Published images are multi-platform (`linux/amd64`, `linux/arm64`), run as numeric non-root
 UID/GID 65532, use pinned build/runtime bases, and carry BuildKit SBOM plus GitHub provenance
 attestations. Release installers pin the image manifest digest.
@@ -158,7 +167,9 @@ make manifests generate   # regenerate CRDs/RBAC/deepcopy after API edits
   freezes the phantom at its last size rather than shrinking it.
 - **Trusted configuration boundary.** A `ShadowWorkload` author selects the Prometheus URL and,
   for raw `promql`, the query. Grant CR write access only to trusted operators; do not expose it
-  as an untrusted multi-tenant API. The client rejects embedded credentials, URL query/fragment
+  as an untrusted multi-tenant API. Write access is effectively node-capacity-administrator access:
+  it can create or resize scheduler-visible reservations on a chosen node and select a network
+  destination reachable by the controller. The client rejects embedded credentials, URL query/fragment
   data and redirects, bounds response size, and never persists backend response bodies or transport
   destinations in status/events. It does not yet enforce an operator-level destination allowlist;
   a trusted author can still select another directly reachable HTTP(S) host.

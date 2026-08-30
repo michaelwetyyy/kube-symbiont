@@ -47,7 +47,7 @@ const (
 	reasonMetricsSynced         = "MetricsSynced"
 	reasonWithinThreshold       = "WithinThreshold"
 	reasonPhantomCreated        = "PhantomCreated"
-	reasonPhantomRecreated      = "PhantomRecreated"
+	reasonPhantomRecreating     = "PhantomRecreating"
 	reasonResized               = "Resized"
 	reasonNodeMissing           = "NodeMissing"
 	reasonNodeNotReady          = "NodeNotReady"
@@ -120,6 +120,7 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	log := logf.FromContext(ctx).WithValues("shadowWorkload", req.NamespacedName, "node", sw.Spec.Node)
+	ctx = logf.IntoContext(ctx, log)
 
 	statusBase := sw.DeepCopy()
 	poll := pollInterval(&sw)
@@ -128,6 +129,7 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	degradedMsg := ""
 	readyReason := reasonWithinThreshold
 	phantomObserved := false
+	requeueImmediately := false
 
 	// Phantom identity/effective requests observed by this pass; only read
 	// when phantomObserved is true (the eligible-management path).
@@ -213,66 +215,38 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		err := r.Get(ctx, key, &pod)
 		switch {
 		case apierrors.IsNotFound(err):
-			fresh, berr := shadow.BuildPhantomPod(&sw, r.Scheme, desired)
-			if berr != nil {
-				return ctrl.Result{}, fmt.Errorf("build phantom pod: %w", berr)
+			created, observedNow, res, cerr := r.createOrRecoverPhantom(ctx, &sw, key, name, desired, poll, setReady, setDegraded)
+			if cerr != nil || res.RequeueAfter > 0 {
+				return res, cerr
 			}
-			if cerr := r.Create(ctx, fresh); cerr != nil {
-				return ctrl.Result{}, fmt.Errorf("create phantom pod %s: %w", name, cerr)
+			if observedNow {
+				pod = *created
+				phantomObserved = true
 			}
-			log.Info("Created phantom Pod", "pod", name, "node", sw.Spec.Node,
-				"cpu", desired.CPU.String(), "memory", desired.Memory.String())
-			r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonPhantomCreated,
-				"Created phantom Pod %s on node %q (cpu=%s memory=%s)", name, sw.Spec.Node, desired.CPU.String(), desired.Memory.String())
-			r.Metrics.ReservationUpdated(sw.Namespace, sw.Name)
-			pod = *fresh
-			phantomObserved = true
-			setReady(reasonPhantomCreated)
 		case err != nil:
 			return ctrl.Result{}, fmt.Errorf("get phantom pod %s: %w", name, err)
+		case !ownedBySw(&pod, &sw):
+			msg := fmt.Sprintf("pod %s exists but is not owned by this ShadowWorkload; refusing to manage it", name)
+			setDegraded(reasonPhantomConflict, "%s", msg)
+			r.warnOnDegradedTransition(&sw, reasonPhantomConflict, msg)
 		case pod.Spec.NodeName != sw.Spec.Node:
 			// Target node changed: the pin must follow. Delete and recreate next pass.
-			if derr := r.Delete(ctx, &pod); derr != nil && !apierrors.IsNotFound(derr) {
+			observedUID := pod.UID
+			if derr := r.Delete(ctx, &pod, client.GracePeriodSeconds(0), client.Preconditions{UID: &observedUID}); derr != nil && !apierrors.IsNotFound(derr) {
+				if apierrors.IsConflict(derr) {
+					return ctrl.Result{RequeueAfter: time.Nanosecond}, nil
+				}
 				return ctrl.Result{}, fmt.Errorf("delete stale phantom pod %s: %w", name, derr)
 			}
 			log.Info("Deleted phantom Pod for node re-pin", "pod", name, "oldNode", pod.Spec.NodeName, "newNode", sw.Spec.Node)
-			r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonPhantomRecreated,
+			r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonPhantomRecreating,
 				"Deleted phantom Pod %s; re-pinning from node %q to %q", name, pod.Spec.NodeName, sw.Spec.Node)
-			setReady(reasonPhantomRecreated)
-		case !ownedBySw(&pod, &sw):
-			setDegraded(reasonPhantomConflict,
-				"pod %s exists but is not owned by this ShadowWorkload; refusing to manage it", name)
-			r.Recorder.Eventf(&sw, corev1.EventTypeWarning, reasonPhantomConflict,
-				"Pod %s already exists without controller ownerRef to this ShadowWorkload", name)
+			setDegraded(reasonPhantomRecreating,
+				"phantom pod %s was deleted for node re-pin; replacement is pending", name)
+			requeueImmediately = true
 		default:
 			phantomObserved = true
-			current := shadow.CurrentPairOf(&pod)
-			if degradedReason == "" && shadow.DriftExceeds(current, desired, sw.Spec.Update.DeltaThresholdPercent) {
-				before := current
-				if rerr := r.resizePhantom(ctx, &pod, desired); rerr != nil {
-					r.Metrics.MeasurementFailed(sw.Namespace, sw.Name, metrics.FailureResizeRejected)
-					setDegraded(reasonResizeRejected, "in-place resize of %s rejected: %v", name, rerr)
-					log.Error(rerr, "In-place resize rejected", "pod", name)
-					r.Recorder.Eventf(&sw, corev1.EventTypeWarning, reasonResizeRejected,
-						"In-place resize of Pod %s rejected (%s -> cpu=%s memory=%s); keeping previous requests",
-						name, rerr, desired.CPU.String(), desired.Memory.String())
-				} else {
-					log.Info("Resized phantom Pod", "pod", name,
-						"cpu", before.CPU.String()+"->"+desired.CPU.String(),
-						"memory", before.Memory.String()+"->"+desired.Memory.String())
-					r.Recorder.Eventf(&sw, corev1.EventTypeNormal, reasonResized,
-						"Resized Pod %s: cpu %s -> %s, memory %s -> %s",
-						name, before.CPU.String(), desired.CPU.String(), before.Memory.String(), desired.Memory.String())
-					now := metav1.Now()
-					sw.Status.LastResize = now
-					sw.Status.CurrentCPU = desired.CPU
-					sw.Status.CurrentMemory = desired.Memory
-					r.Metrics.ReservationUpdated(sw.Namespace, sw.Name)
-					setReady(reasonResized)
-				}
-			} else if degradedReason == "" {
-				setReady(reasonWithinThreshold)
-			}
+			r.resizeIfDrifting(ctx, &sw, &pod, name, desired, degradedReason == "", setDegraded, setReady)
 		}
 		phantomPodName = name
 		observedPod = &pod
@@ -316,7 +290,10 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, fmt.Errorf("patch ShadowWorkload status: %w", perr)
 	}
 
-	log.Info("Reconciled", "ready", degradedReason == "", "requeueAfter", poll.String())
+	log.V(1).Info("Reconciled", "ready", degradedReason == "", "requeueAfter", poll.String())
+	if requeueImmediately {
+		return ctrl.Result{RequeueAfter: time.Nanosecond}, nil
+	}
 	return ctrl.Result{RequeueAfter: poll}, nil
 }
 
@@ -333,13 +310,13 @@ func (r *ShadowWorkloadReconciler) measure(
 	queries, err := sources.Resolve(&sw.Spec)
 	if err != nil {
 		r.Metrics.MeasurementFailed(sw.Namespace, sw.Name, metrics.FailureSourceMissing)
-		setDegraded(reasonSourceInvalid, "%v", err)
+		setDegraded(reasonSourceInvalid, "source configuration is invalid")
 		return
 	}
 	querier, err := r.QuerierFor(sw.Spec.Metrics.PrometheusURL)
 	if err != nil {
 		r.Metrics.MeasurementFailed(sw.Namespace, sw.Name, metrics.FailureSourceMissing)
-		setDegraded(reasonSourceInvalid, "metrics backend config: %v", err)
+		setDegraded(reasonSourceInvalid, "metrics backend configuration is invalid")
 		return
 	}
 	qctx, cancel := context.WithTimeout(ctx, queryTimeout+5*time.Second)
@@ -351,15 +328,21 @@ func (r *ShadowWorkloadReconciler) measure(
 			reason = metrics.FailureMultiSample
 		}
 		r.Metrics.MeasurementFailed(sw.Namespace, sw.Name, reason)
-		setDegraded(reasonPrometheusUnavailable, "%v", qerr)
-		log.Error(qerr, "Failed to query metrics backend", "prometheusURL", sw.Spec.Metrics.PrometheusURL)
+		setDegraded(reasonPrometheusUnavailable, "metrics backend query failed")
+		// Backend-controlled errors can contain URLs, identifiers, reflected
+		// query text, or very large strings. Durable status, Events and logs use
+		// only the bounded classification.
+		log.Error(errors.New(string(reason)), "Failed to query metrics backend")
 		r.Recorder.Eventf(sw, corev1.EventTypeWarning, reasonPrometheusUnavailable,
-			"Prometheus query failed: %v", qerr)
+			"Metrics backend query failed (%s)", reason)
 		return
 	}
 	r.Metrics.ObservedMeasurement(sw.Namespace, sw.Name, cpu, mem)
 	r.Metrics.MeasurementSucceeded(sw.Namespace, sw.Name, time.Now())
-	log.Info("Measured bare-metal footprint", "cpuCores", cpu, "memoryBytes", mem, "seriesFound", found)
+	// Per-poll telemetry lives in the kube_symbiont_* metrics series; keep
+	// the verbose log for debugging only so a 30-second poll does not emit
+	// thousands of identical lines per day.
+	log.V(1).Info("Measured bare-metal footprint", "cpuCores", cpu, "memoryBytes", mem, "seriesFound", found)
 	*cpuOut, *memOut = cpu, mem
 }
 
@@ -377,7 +360,8 @@ func (r *ShadowWorkloadReconciler) resizePhantom(ctx context.Context, pod *corev
 		resized.Spec.Containers[i].Resources.Requests = resources.DeepCopy()
 		resized.Spec.Containers[i].Resources.Limits = resources.DeepCopy()
 	}
-	if err := r.SubResource("resize").Patch(ctx, resized, client.StrategicMergeFrom(base)); err != nil {
+	patch := client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})
+	if err := r.SubResource("resize").Patch(ctx, resized, patch); err != nil {
 		return err
 	}
 	// Keep the caller's observation aligned with the accepted API mutation so
@@ -412,10 +396,146 @@ func (r *ShadowWorkloadReconciler) warnOnDegradedTransition(sw *symbiontv1alpha1
 	r.Recorder.Eventf(sw, corev1.EventTypeWarning, reason, "%s", msg)
 }
 
+// resolveCreateConflict handles a Create that collided with a same-name pod
+// invisible to the scoped informer. Foreign pods are reported untouched. An
+// owned pod that lost its discovery labels is deleted and recreated from the
+// canonical hardened template, avoiding broad cluster-wide Pod update access.
+func (r *ShadowWorkloadReconciler) resolveCreateConflict(
+	ctx context.Context,
+	sw *symbiontv1alpha1.ShadowWorkload,
+	key client.ObjectKey,
+	name string,
+	poll time.Duration,
+) (bool, ctrl.Result, error) {
+	var live corev1.Pod
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	gerr := reader.Get(ctx, key, &live)
+	if gerr != nil && !apierrors.IsNotFound(gerr) {
+		return false, ctrl.Result{}, fmt.Errorf("read existing phantom pod %s: %w", name, gerr)
+	}
+	if apierrors.IsNotFound(gerr) {
+		// The conflicting object vanished between Create and Get; retry
+		// cleanly on the next poll.
+		return false, ctrl.Result{RequeueAfter: poll}, nil
+	}
+	if !ownedBySw(&live, sw) {
+		return true, ctrl.Result{}, nil
+	}
+	observedUID := live.UID
+	if derr := r.Delete(ctx, &live, client.GracePeriodSeconds(0), client.Preconditions{UID: &observedUID}); derr != nil && !apierrors.IsNotFound(derr) {
+		if apierrors.IsConflict(derr) {
+			return false, ctrl.Result{RequeueAfter: time.Nanosecond}, nil
+		}
+		return false, ctrl.Result{}, fmt.Errorf("delete noncanonical phantom pod %s: %w", name, derr)
+	}
+	logf.FromContext(ctx).Info("Deleted noncanonical phantom Pod", "pod", name)
+	r.Recorder.Eventf(sw, corev1.EventTypeNormal, reasonPhantomRecreating,
+		"Deleted owned phantom Pod %s after its management labels changed; canonical recreation pending", name)
+	return false, ctrl.Result{RequeueAfter: poll}, nil
+}
+
+// resizeIfDrifting patches the phantom's requests and limits together when
+// relative drift exceeds deltaThresholdPercent. Resize rejections keep the
+// last accepted requests and report Degraded/ResizeRejected.
+func (r *ShadowWorkloadReconciler) resizeIfDrifting(
+	ctx context.Context,
+	sw *symbiontv1alpha1.ShadowWorkload,
+	pod *corev1.Pod,
+	name string,
+	desired symbiontv1alpha1.ResourcePair,
+	healthy bool,
+	setDegraded func(reason, format string, args ...any),
+	setReady func(reason string),
+) {
+	log := logf.FromContext(ctx)
+	current := shadow.CurrentPairOf(pod)
+	if healthy && shadow.DriftExceeds(current, desired, sw.Spec.Update.DeltaThresholdPercent) {
+		before := current
+		if rerr := r.resizePhantom(ctx, pod, desired); rerr != nil {
+			r.Metrics.MeasurementFailed(sw.Namespace, sw.Name, metrics.FailureResizeRejected)
+			setDegraded(reasonResizeRejected, "in-place resize of %s was rejected", name)
+			log.Error(errors.New(reasonResizeRejected), "In-place resize rejected", "pod", name)
+			r.Recorder.Eventf(sw, corev1.EventTypeWarning, reasonResizeRejected,
+				"In-place resize of Pod %s was rejected; keeping previous requests (desired cpu=%s memory=%s)",
+				name, desired.CPU.String(), desired.Memory.String())
+			return
+		}
+		log.Info("Resized phantom Pod", "pod", name,
+			"cpu", before.CPU.String()+"->"+desired.CPU.String(),
+			"memory", before.Memory.String()+"->"+desired.Memory.String())
+		r.Recorder.Eventf(sw, corev1.EventTypeNormal, reasonResized,
+			"Resized Pod %s: cpu %s -> %s, memory %s -> %s",
+			name, before.CPU.String(), desired.CPU.String(), before.Memory.String(), desired.Memory.String())
+		now := metav1.Now()
+		sw.Status.LastResize = now
+		sw.Status.CurrentCPU = desired.CPU
+		sw.Status.CurrentMemory = desired.Memory
+		r.Metrics.ReservationUpdated(sw.Namespace, sw.Name)
+		setReady(reasonResized)
+		return
+	}
+	if healthy {
+		setReady(reasonWithinThreshold)
+	}
+}
+
+// ownedBySw reports whether the pod carries this ShadowWorkload's controller
+// owner reference.
 func ownedBySw(pod *corev1.Pod, sw *symbiontv1alpha1.ShadowWorkload) bool {
 	ref := metav1.GetControllerOf(pod)
-	return ref != nil && ref.UID == sw.UID &&
+	return ref != nil && ref.Name == sw.Name && ref.UID == sw.UID &&
 		ref.Kind == "ShadowWorkload" && ref.APIVersion == symbiontv1alpha1.GroupVersion.String()
+}
+
+// createOrRecoverPhantom builds and creates the phantom for a ShadowWorkload
+// whose previous phantom is gone from the scoped cache. A Create collision
+// against an object invisible to that cache is verified through the uncached
+// reader: foreign pods surface as Degraded/PhantomConflict, while owned
+// noncanonical phantoms are deleted for canonical recreation.
+func (r *ShadowWorkloadReconciler) createOrRecoverPhantom(
+	ctx context.Context,
+	sw *symbiontv1alpha1.ShadowWorkload,
+	key client.ObjectKey,
+	name string,
+	desired symbiontv1alpha1.ResourcePair,
+	poll time.Duration,
+	setReady func(reason string),
+	setDegraded func(reason, format string, args ...any),
+) (*corev1.Pod, bool, ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	fresh, berr := shadow.BuildPhantomPod(sw, r.Scheme, desired)
+	if berr != nil {
+		return nil, false, ctrl.Result{}, fmt.Errorf("build phantom pod: %w", berr)
+	}
+	if cerr := r.Create(ctx, fresh); cerr != nil {
+		if !apierrors.IsAlreadyExists(cerr) {
+			return nil, false, ctrl.Result{}, fmt.Errorf("create phantom pod %s: %w", name, cerr)
+		}
+		// The scoped Pod informer only tracks pods carrying the managed-by
+		// label. Resolve the invisible same-name object exactly once through
+		// the uncached reader before deciding whether to recover or refuse it.
+		conflict, res, cerr2 := r.resolveCreateConflict(ctx, sw, key, name, poll)
+		if cerr2 != nil || res.RequeueAfter > 0 {
+			return nil, false, res, cerr2
+		}
+		if conflict {
+			msg := fmt.Sprintf("pod %s exists without the managed-by label or controller owner reference; refusing to manage it", name)
+			setDegraded(reasonPhantomConflict, "%s", msg)
+			r.warnOnDegradedTransition(sw, reasonPhantomConflict, msg)
+			return nil, false, ctrl.Result{}, nil
+		}
+		return nil, false, res, nil
+	}
+	log.Info("Created phantom Pod", "pod", name, "node", sw.Spec.Node,
+		"cpu", desired.CPU.String(), "memory", desired.Memory.String())
+	r.Recorder.Eventf(sw, corev1.EventTypeNormal, reasonPhantomCreated,
+		"Created phantom Pod %s on node %q (cpu=%s memory=%s)", name, sw.Spec.Node, desired.CPU.String(), desired.Memory.String())
+	r.Metrics.ReservationUpdated(sw.Namespace, sw.Name)
+	setReady(reasonPhantomCreated)
+	return fresh, true, ctrl.Result{}, nil
 }
 
 func pollInterval(sw *symbiontv1alpha1.ShadowWorkload) time.Duration {

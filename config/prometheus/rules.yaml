@@ -1,0 +1,108 @@
+# PrometheusRule carrying the recording rules and bounded alerts for the
+# frozen kube_symbiont_shadowworkload_* series contract plus Prometheus's
+# standard up series for scrape health. Workload labels stay {namespace,name}
+# (plus the bounded failure reason), so cardinality is bounded by the number
+# of ShadowWorkload objects. Alert timing is calibrated
+# for the documented 30s ShadowWorkload poll profile. Requires
+# prometheus-operator (ruleSelector matching is up to the adopting stack).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  labels:
+    app.kubernetes.io/name: kube-symbiont
+    app.kubernetes.io/managed-by: kustomize
+  name: controller-manager-rules
+  namespace: system
+spec:
+  groups:
+  - name: kube-symbiont.shadowworkload.recording
+    interval: 30s
+    rules:
+    # Drift = scheduler reservation minus real measured consumption. Positive
+    # means the phantom reserves more than the workload currently uses (the
+    # normal floor/smoothing case); persistently negative means the workload
+    # outgrew the ceiling or clamp.
+    - record: kube_symbiont:shadowworkload_reservation_drift_cpu_cores
+      expr: |
+        kube_symbiont_shadowworkload_reserved_cpu_cores
+        - kube_symbiont_shadowworkload_measured_cpu_cores
+    - record: kube_symbiont:shadowworkload_reservation_drift_memory_bytes
+      expr: |
+        kube_symbiont_shadowworkload_reserved_memory_bytes
+        - kube_symbiont_shadowworkload_measured_memory_bytes
+    - record: kube_symbiont:shadowworkload_measurement_age_seconds
+      expr: |
+        time() - kube_symbiont_shadowworkload_last_successful_measurement_timestamp_seconds
+  - name: kube-symbiont.shadowworkload.alerts
+    interval: 30s
+    rules:
+    - alert: KubeSymbiontMeasurementStale
+      expr: kube_symbiont:shadowworkload_measurement_age_seconds > 120
+      for: 1m
+      labels:
+        severity: warning
+      annotations:
+        summary: ShadowWorkload {{ $labels.namespace }}/{{ $labels.name }} has no recent successful measurement
+        description: >
+          With the documented 30s poll profile, the last successful
+          measurement is more than four poll intervals old and remained so
+          for another minute. The phantom keeps its last truthful reservation;
+          check backend reachability and the ShadowWorkload condition.
+    - alert: KubeSymbiontReconcileFailures
+      expr: increase(kube_symbiont_shadowworkload_measurement_failures_total[10m]) > 0
+      for: 1m
+      labels:
+        severity: warning
+      annotations:
+        summary: ShadowWorkload {{ $labels.namespace }}/{{ $labels.name }} reported {{ $labels.reason }}
+        description: >
+          A measurement or reservation-update failure occurred in the last
+          ten minutes. The bounded reason label distinguishes backend
+          unavailability, ambiguous results, rejected resize and missing
+          source configuration.
+    - alert: KubeSymbiontReservationFlapping
+      expr: increase(kube_symbiont_shadowworkload_reservation_updates_total[15m]) > 6
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: ShadowWorkload {{ $labels.namespace }}/{{ $labels.name }} reservation is flapping
+        description: >
+          More than six accepted reservation mutations within fifteen minutes
+          suggests deltaThresholdPercent is too low for this workload's
+          volatility.
+    - alert: KubeSymbiontDriftBelowReservationCPU
+      expr: kube_symbiont:shadowworkload_reservation_drift_cpu_cores < -0.25
+      for: 15m
+      labels:
+        severity: info
+      annotations:
+        summary: Measured CPU exceeds the phantom reservation on {{ $labels.namespace }}/{{ $labels.name }}
+        description: >
+          Real consumption has exceeded the scheduler reservation for fifteen
+          minutes. A ceiling clamp is one possible cause; measurement-to-resize
+          delay or a rejected update can also cause negative drift. Inspect the
+          ShadowWorkload condition before changing bounds.
+    - alert: KubeSymbiontDriftBelowReservationMemory
+      expr: kube_symbiont:shadowworkload_reservation_drift_memory_bytes < -268435456
+      for: 15m
+      labels:
+        severity: info
+      annotations:
+        summary: Measured memory exceeds the phantom reservation on {{ $labels.namespace }}/{{ $labels.name }}
+        description: >
+          Real memory consumption has exceeded the scheduler reservation by
+          more than 256 MiB for fifteen minutes. Check for a ceiling clamp,
+          measurement-to-resize delay or rejected update before changing
+          bounds.
+    - alert: KubeSymbiontMetricsTargetDown
+      expr: absent(up{namespace="kube-symbiont-system",service="kube-symbiont-controller-manager-metrics-service"} == 1)
+      for: 2m
+      labels:
+        severity: warning
+      annotations:
+        summary: kube-symbiont metrics target is unavailable
+        description: >
+          Prometheus has not observed a healthy kube-symbiont controller
+          metrics target for two minutes. Check ServiceMonitor selection,
+          metrics TLS/authentication and controller readiness.

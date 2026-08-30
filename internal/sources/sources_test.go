@@ -170,7 +170,14 @@ func TestClientQuery(t *testing.T) {
 		{
 			name: "non-vector result rejected",
 			handler: func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"scalar","result":[{"value":[0,"1"]}]}}`))
+				_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"secret-result-type","result":[{"value":[0,"1"]}]}}`))
+			},
+			wantErr: true,
+		},
+		{
+			name: "nonnumeric sample rejected",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"secret-sample"]}]}}`))
 			},
 			wantErr: true,
 		},
@@ -201,8 +208,10 @@ func TestClientQuery(t *testing.T) {
 			if tt.wantErr && err == nil {
 				t.Fatal("want error, got nil")
 			}
-			if err != nil && strings.Contains(err.Error(), "secret-response-body") {
-				t.Fatalf("backend response body leaked into error: %v", err)
+			for _, secret := range []string{"secret-response-body", "secret-result-type", "secret-sample"} {
+				if err != nil && strings.Contains(err.Error(), secret) {
+					t.Fatalf("backend-controlled value %q leaked into error: %v", secret, err)
+				}
 			}
 			if !tt.wantErr && err != nil {
 				t.Fatalf("unexpected error: %v", err)

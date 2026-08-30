@@ -168,7 +168,12 @@ func BuildPhantomPod(sw *symbiontv1alpha1.ShadowWorkload, scheme *runtime.Scheme
 		Spec: corev1.PodSpec{
 			NodeName:          sw.Spec.Node,
 			PriorityClassName: BallastPriorityClassName,
-			RestartPolicy:     corev1.RestartPolicyAlways,
+			// The pause container performs no Kubernetes API calls, so it must
+			// never receive a projected service-account token. Phantoms are
+			// plain pods on possibly shared nodes; the default auto-mount would
+			// hand every node's tenants a live manager-namespace credential.
+			AutomountServiceAccountToken: ptr.To(false),
+			RestartPolicy:                corev1.RestartPolicyAlways,
 			SecurityContext: &corev1.PodSecurityContext{
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
