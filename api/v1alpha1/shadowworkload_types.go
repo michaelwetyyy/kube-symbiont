@@ -24,14 +24,21 @@ import (
 
 // SourceType selects which bare-metal source a ShadowWorkload measures.
 //
-// v0.1 implements docker and promql; cgroup and systemd arrive in v0.2.
-// +kubebuilder:validation:Enum=docker;promql
+// +kubebuilder:validation:Enum=docker;cgroup;systemd;promql
 type SourceType string
 
 const (
 	// SourceTypeDocker shadows Docker containers discovered via cAdvisor
 	// cgroup id-prefix selectors (/system.slice/docker-<id>).
 	SourceTypeDocker SourceType = "docker"
+
+	// SourceTypeCgroup shadows cgroups selected by an absolute path glob in
+	// cAdvisor's id label.
+	SourceTypeCgroup SourceType = "cgroup"
+
+	// SourceTypeSystemd shadows one systemd system service or scope. The unit
+	// name and slice are resolved to an exact cgroup id.
+	SourceTypeSystemd SourceType = "systemd"
 
 	// SourceTypePromQL passes raw PromQL through to the configured
 	// Prometheus. Escape hatch for anything the typed sources cannot
@@ -78,8 +85,11 @@ type ShadowWorkloadSpec struct {
 }
 
 // SourceSpec is a one-of container selecting the measured bare-metal source.
-// +kubebuilder:validation:XValidation:rule="[has(self.docker), has(self.promql)].filter(x, x).size() == 1",message="exactly one of source.docker or source.promql must be set"
+// +kubebuilder:validation:XValidation:rule="[has(self.docker), has(self.cgroup), has(self.systemd), has(self.promql)].filter(x, x).size() == 1",message="exactly one of source.docker, source.cgroup, source.systemd or source.promql must be set"
 // +kubebuilder:validation:XValidation:rule="(self.type == 'docker') == has(self.docker)",message="source.type must match the configured source block"
+// +kubebuilder:validation:XValidation:rule="(self.type == 'cgroup') == has(self.cgroup)",message="source.type must match the configured source block"
+// +kubebuilder:validation:XValidation:rule="(self.type == 'systemd') == has(self.systemd)",message="source.type must match the configured source block"
+// +kubebuilder:validation:XValidation:rule="(self.type == 'promql') == has(self.promql)",message="source.type must match the configured source block"
 type SourceSpec struct {
 	// type selects the source implementation to resolve.
 	Type SourceType `json:"type"`
@@ -89,6 +99,16 @@ type SourceSpec struct {
 	// Required when type is docker.
 	// +optional
 	Docker *DockerSource `json:"docker,omitempty"`
+
+	// cgroup shadows cgroups selected by an absolute path glob in cAdvisor's
+	// id label. Required when type is cgroup.
+	// +optional
+	Cgroup *CgroupSource `json:"cgroup,omitempty"`
+
+	// systemd shadows one system service or scope in a named systemd slice.
+	// Required when type is systemd.
+	// +optional
+	Systemd *SystemdSource `json:"systemd,omitempty"`
 
 	// promql supplies raw PromQL for CPU cores and memory bytes. Required when
 	// type is promql. Both queries must return a single vector sample after
@@ -120,6 +140,65 @@ type DockerSource struct {
 	CadvisorInstance string `json:"cadvisorInstance"`
 }
 
+// CgroupSource resolves an absolute cgroup path glob to a Prometheus id-label
+// regular expression. The first path component is literal; * and ? may be used
+// in subsequent components and never match '/'. This keeps the selector inside
+// one explicit top-level hierarchy and prevents accidental kubepods accounting.
+// +kubebuilder:validation:XValidation:rule="!self.pathGlob.contains('**')",message="cgroup.pathGlob does not support recursive ** wildcards"
+// +kubebuilder:validation:XValidation:rule="!(self.pathGlob == '/kubepods' || self.pathGlob.startsWith('/kubepods/') || self.pathGlob.startsWith('/kubepods.'))",message="cgroup.pathGlob must not select the Kubernetes cgroup hierarchy"
+type CgroupSource struct {
+	// pathGlob selects one or more cAdvisor cgroup id paths. It must name a
+	// literal non-kubepods top-level cgroup. '*' matches zero or more characters
+	// and '?' matches one character within a path component. Recursive '**'
+	// matching is intentionally unsupported.
+	// +kubebuilder:validation:MinLength=2
+	// +kubebuilder:validation:MaxLength=1024
+	// +kubebuilder:validation:Pattern=`^/[-A-Za-z0-9_.:@%+=,~]+(/[-A-Za-z0-9_.:@%+=,~*?]+)*$`
+	PathGlob string `json:"pathGlob"`
+
+	// cadvisorJob is the Prometheus job label emitted by the standalone
+	// cAdvisor instance monitoring this node.
+	// +kubebuilder:default="cadvisor"
+	CadvisorJob string `json:"cadvisorJob,omitempty"`
+
+	// cadvisorInstance pins the selector to one standalone cAdvisor target.
+	// It is required so a multi-target job cannot aggregate another node into
+	// this node's scheduler reservation.
+	// +kubebuilder:validation:MinLength=1
+	CadvisorInstance string `json:"cadvisorInstance"`
+}
+
+// SystemdSource resolves a system service or scope and its systemd slice to an
+// exact cAdvisor cgroup id. User-manager units are intentionally outside this
+// typed source because their hierarchy includes a runtime UID; use cgroup for
+// those paths.
+type SystemdSource struct {
+	// unit is the systemd .service or .scope unit to measure.
+	// +kubebuilder:validation:MinLength=7
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.:@-]+[.](service|scope)$`
+	Unit string `json:"unit"`
+
+	// slice is the systemd system slice containing unit. Nested slice names
+	// such as media-services.slice are expanded to their cgroup hierarchy.
+	// +kubebuilder:default="system.slice"
+	// +kubebuilder:validation:MinLength=7
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.]+(-[A-Za-z0-9_.]+)*[.]slice$`
+	Slice string `json:"slice,omitempty"`
+
+	// cadvisorJob is the Prometheus job label emitted by the standalone
+	// cAdvisor instance monitoring this node.
+	// +kubebuilder:default="cadvisor"
+	CadvisorJob string `json:"cadvisorJob,omitempty"`
+
+	// cadvisorInstance pins the selector to one standalone cAdvisor target.
+	// It is required so a multi-target job cannot aggregate another node into
+	// this node's scheduler reservation.
+	// +kubebuilder:validation:MinLength=1
+	CadvisorInstance string `json:"cadvisorInstance"`
+}
+
 // PromQLSource passes raw CPU/memory queries straight through to Prometheus.
 type PromQLSource struct {
 	// cpuCores is an instant-query expression returning total CPU cores used by
@@ -145,7 +224,8 @@ type MetricsConfig struct {
 	PrometheusURL string `json:"prometheusURL"`
 
 	// window is the range window the controller injects into generated
-	// queries (docker source) — the smoothing horizon of the moving average.
+	// queries (docker, cgroup and systemd sources) — the smoothing horizon of
+	// the moving average.
 	// promql passthrough embeds its own ranges; window still documents the
 	// intended smoothing horizon.
 	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ms|s|m|h))+$`

@@ -41,3 +41,23 @@ spec:
 #    promql:
 #      cpuCores: 'sum(rate(container_cpu_usage_seconds_total{id=~"/system.slice/docker-.*"}[5m]))'
 #      memoryBytes: 'sum(avg_over_time(container_memory_working_set_bytes{id=~"/system.slice/docker-.*"}[5m]))'
+#
+# Cgroup path-glob alternative. The top-level component must be literal; '*'
+# and '?' never cross '/'. The kubepods hierarchy and recursive '**' are
+# rejected to prevent scheduler-visible workloads being counted twice:
+#  source:
+#    type: cgroup
+#    cgroup:
+#      pathGlob: /system.slice/media-*.service
+#      cadvisorJob: cadvisor
+#      cadvisorInstance: 192.0.2.10:4194
+#
+# Systemd system-unit alternative. Nested slice names are expanded to their
+# cgroup hierarchy; system.slice is the default:
+#  source:
+#    type: systemd
+#    systemd:
+#      unit: plexmediaserver.service
+#      slice: system.slice
+#      cadvisorJob: cadvisor
+#      cadvisorInstance: 192.0.2.10:4194

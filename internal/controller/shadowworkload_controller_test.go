@@ -129,8 +129,10 @@ func makeTestNode(name string, ready *corev1.ConditionStatus) *corev1.Node {
 }
 
 const (
-	testNodeName        = "lab"
-	terminatingNodeName = "doomed"
+	testNodeName         = "lab"
+	testCadvisorInstance = "192.0.2.10:4194"
+	testSystemdUnit      = "backup.service"
+	terminatingNodeName  = "doomed"
 )
 
 var readyTrue = corev1.ConditionTrue
@@ -152,7 +154,7 @@ func validShadowWorkload(name string) *symbiontv1alpha1.ShadowWorkload {
 			Node: testNodeName,
 			Source: symbiontv1alpha1.SourceSpec{
 				Type:   symbiontv1alpha1.SourceTypeDocker,
-				Docker: &symbiontv1alpha1.DockerSource{Selector: symbiontv1alpha1.SelectorAll, CadvisorInstance: "192.0.2.10:4194"},
+				Docker: &symbiontv1alpha1.DockerSource{Selector: symbiontv1alpha1.SelectorAll, CadvisorInstance: testCadvisorInstance},
 			},
 			Metrics: symbiontv1alpha1.MetricsConfig{
 				PrometheusURL: "http://prometheus.monitoring:9090",
@@ -257,6 +259,89 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(err).To(HaveOccurred())
 		Expect(apierrors.IsInvalid(err)).To(BeTrue())
 	})
+
+	DescribeTable("should admit each generated source type",
+		func(source symbiontv1alpha1.SourceSpec) {
+			sw := validShadowWorkload("valid-source-admission")
+			sw.Spec.Source = source
+			Expect(k8sClient.Create(ctx, sw)).To(Succeed())
+			switch source.Type {
+			case symbiontv1alpha1.SourceTypeCgroup:
+				Expect(sw.Spec.Source.Cgroup.CadvisorJob).To(Equal("cadvisor"))
+			case symbiontv1alpha1.SourceTypeSystemd:
+				Expect(sw.Spec.Source.Systemd.CadvisorJob).To(Equal("cadvisor"))
+				Expect(sw.Spec.Source.Systemd.Slice).To(Equal("system.slice"))
+			}
+			deleteAndWait(sw)
+		},
+		Entry("cgroup path glob", symbiontv1alpha1.SourceSpec{
+			Type: symbiontv1alpha1.SourceTypeCgroup,
+			Cgroup: &symbiontv1alpha1.CgroupSource{
+				PathGlob:         "/system.slice/*.service",
+				CadvisorInstance: testCadvisorInstance,
+			},
+		}),
+		Entry("systemd unit", symbiontv1alpha1.SourceSpec{
+			Type: symbiontv1alpha1.SourceTypeSystemd,
+			Systemd: &symbiontv1alpha1.SystemdSource{
+				Unit:             "a.scope",
+				CadvisorInstance: testCadvisorInstance,
+			},
+		}),
+	)
+
+	DescribeTable("should reject invalid typed source configuration at admission",
+		func(source symbiontv1alpha1.SourceSpec) {
+			bad := validShadowWorkload("bad-typed-source")
+			bad.Spec.Source = source
+			err := k8sClient.Create(ctx, bad)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+		},
+		Entry("cgroup glob with wildcard top level", symbiontv1alpha1.SourceSpec{
+			Type: symbiontv1alpha1.SourceTypeCgroup,
+			Cgroup: &symbiontv1alpha1.CgroupSource{
+				PathGlob:         "/*.slice/*.service",
+				CadvisorInstance: testCadvisorInstance,
+			},
+		}),
+		Entry("cgroup recursive glob", symbiontv1alpha1.SourceSpec{
+			Type: symbiontv1alpha1.SourceTypeCgroup,
+			Cgroup: &symbiontv1alpha1.CgroupSource{
+				PathGlob:         "/system.slice/**",
+				CadvisorInstance: testCadvisorInstance,
+			},
+		}),
+		Entry("Kubernetes cgroup hierarchy", symbiontv1alpha1.SourceSpec{
+			Type: symbiontv1alpha1.SourceTypeCgroup,
+			Cgroup: &symbiontv1alpha1.CgroupSource{
+				PathGlob:         "/kubepods.slice/*.slice",
+				CadvisorInstance: testCadvisorInstance,
+			},
+		}),
+		Entry("systemd unsupported unit type", symbiontv1alpha1.SourceSpec{
+			Type: symbiontv1alpha1.SourceTypeSystemd,
+			Systemd: &symbiontv1alpha1.SystemdSource{
+				Unit:             "backup.timer",
+				CadvisorInstance: testCadvisorInstance,
+			},
+		}),
+		Entry("systemd slice with empty hierarchy component", symbiontv1alpha1.SourceSpec{
+			Type: symbiontv1alpha1.SourceTypeSystemd,
+			Systemd: &symbiontv1alpha1.SystemdSource{
+				Unit:             testSystemdUnit,
+				Slice:            "media--services.slice",
+				CadvisorInstance: testCadvisorInstance,
+			},
+		}),
+		Entry("source type and block mismatch", symbiontv1alpha1.SourceSpec{
+			Type: symbiontv1alpha1.SourceTypeDocker,
+			Systemd: &symbiontv1alpha1.SystemdSource{
+				Unit:             testSystemdUnit,
+				CadvisorInstance: testCadvisorInstance,
+			},
+		}),
+	)
 
 	DescribeTable("should reject unsafe update bounds at admission",
 		func(mutate func(*symbiontv1alpha1.ShadowWorkload)) {

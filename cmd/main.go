@@ -43,6 +43,7 @@ import (
 	symbiontv1alpha1 "github.com/michaelwetyyy/kube-symbiont/api/v1alpha1"
 	"github.com/michaelwetyyy/kube-symbiont/internal/controller"
 	"github.com/michaelwetyyy/kube-symbiont/internal/shadow"
+	"github.com/michaelwetyyy/kube-symbiont/internal/sources"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -52,6 +53,17 @@ var (
 	version  = "dev"
 	commit   = "unknown"
 )
+
+type repeatedStrings []string
+
+func (values *repeatedStrings) String() string {
+	return fmt.Sprintf("%v", []string(*values))
+}
+
+func (values *repeatedStrings) Set(value string) error {
+	*values = append(*values, value)
+	return nil
+}
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -70,6 +82,8 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var showVersion bool
+	var allowAnyPrometheusDestination bool
+	var allowedPrometheusDestinations repeatedStrings
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -89,6 +103,12 @@ func main() {
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.BoolVar(&showVersion, "version", false, "Print version and source revision, then exit.")
+	flag.Var(&allowedPrometheusDestinations, "prometheus-allowed-destination",
+		"Prometheus origin allowed for ShadowWorkloads, as an exact http(s)://host[:port] value; "+
+			"repeat for multiple origins.")
+	flag.BoolVar(&allowAnyPrometheusDestination, "prometheus-allow-any-destination", false,
+		"Trust ShadowWorkload authors to select any safe HTTP(S) Prometheus destination; "+
+			"incompatible with destination rules.")
 	opts := defaultZapOptions()
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -98,6 +118,13 @@ func main() {
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	prometheusDestinationPolicy, err := sources.NewDestinationPolicy(
+		allowedPrometheusDestinations, allowAnyPrometheusDestination)
+	if err != nil {
+		setupLog.Error(err, "Invalid Prometheus destination policy")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -205,9 +232,10 @@ func main() {
 	}
 
 	if err := (&controller.ShadowWorkloadReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		APIReader: mgr.GetAPIReader(),
+		Client:                      mgr.GetClient(),
+		Scheme:                      mgr.GetScheme(),
+		APIReader:                   mgr.GetAPIReader(),
+		PrometheusDestinationPolicy: prometheusDestinationPolicy,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "shadowworkload")
 		os.Exit(1)

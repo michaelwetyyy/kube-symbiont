@@ -54,6 +54,9 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
+          # Operator-owned egress boundary. Repeat this exact-origin flag for
+          # every Prometheus backend that ShadowWorkloads may select.
+          - --prometheus-allowed-destination=http://kube-prometheus-stack-prometheus.monitoring:9090
         image: controller:latest
         name: manager
         ports:
