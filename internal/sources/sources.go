@@ -53,6 +53,11 @@ const dockerCgroupIDSelector = `id=~"/system.slice/docker-.*"`
 // re-validated here so generated queries can never embed arbitrary strings.
 var windowPattern = regexp.MustCompile(`^([0-9]+(\.[0-9]+)?(ms|s|m|h))+$`)
 
+var (
+	systemdUnitPattern  = regexp.MustCompile(`^[A-Za-z0-9_.:@-]+\.(service|scope)$`)
+	systemdSlicePattern = regexp.MustCompile(`^[A-Za-z0-9_.]+(-[A-Za-z0-9_.]+)*\.slice$`)
+)
+
 // ErrMultiSample marks a query that resolved to more than one vector sample.
 // Callers classify it with errors.Is instead of parsing error text, keeping
 // failure reporting bounded and label-safe.
@@ -60,12 +65,25 @@ var ErrMultiSample = errors.New("multi-sample result")
 
 // Resolve turns a validated ShadowWorkloadSpec into its PromQL pair.
 func Resolve(spec *symbiontv1alpha1.ShadowWorkloadSpec) (Queries, error) {
+	if spec == nil {
+		return Queries{}, errors.New("shadow workload spec is required")
+	}
 	switch spec.Source.Type {
 	case symbiontv1alpha1.SourceTypeDocker:
 		if spec.Source.Docker == nil {
 			return Queries{}, fmt.Errorf("source type %q requires source.docker", spec.Source.Type)
 		}
 		return resolveDocker(spec.Source.Docker, spec.Metrics.Window)
+	case symbiontv1alpha1.SourceTypeCgroup:
+		if spec.Source.Cgroup == nil {
+			return Queries{}, fmt.Errorf("source type %q requires source.cgroup", spec.Source.Type)
+		}
+		return resolveCgroup(spec.Source.Cgroup, spec.Metrics.Window)
+	case symbiontv1alpha1.SourceTypeSystemd:
+		if spec.Source.Systemd == nil {
+			return Queries{}, fmt.Errorf("source type %q requires source.systemd", spec.Source.Type)
+		}
+		return resolveSystemd(spec.Source.Systemd, spec.Metrics.Window)
 	case symbiontv1alpha1.SourceTypePromQL:
 		if spec.Source.PromQL == nil {
 			return Queries{}, fmt.Errorf("source type %q requires source.promql", spec.Source.Type)
@@ -80,24 +98,64 @@ func Resolve(spec *symbiontv1alpha1.ShadowWorkloadSpec) (Queries, error) {
 }
 
 // resolveDocker generates id-prefix selectors scoped to the node's standalone
-// cadvisor job (and instance when pinned). selector "all" shadows every
-// bare-metal Docker container on the node; it is currently the only value the
-// API admits for v0.1.
+// cadvisor job and required instance. Selector "all" shadows every bare-metal
+// Docker container on the node; it is the only Docker selector the API admits.
 func resolveDocker(docker *symbiontv1alpha1.DockerSource, window string) (Queries, error) {
+	return generatedQueries(docker.CadvisorJob, docker.CadvisorInstance, dockerCgroupIDSelector, window, "docker")
+}
+
+// resolveCgroup converts the API's deliberately small path-glob language into
+// an anchored RE2 expression for cAdvisor's id label. Wildcards never cross a
+// slash, so a literal top-level component remains a hard accounting boundary.
+func resolveCgroup(cgroup *symbiontv1alpha1.CgroupSource, window string) (Queries, error) {
+	idPattern, err := cgroupGlobRegex(cgroup.PathGlob)
+	if err != nil {
+		return Queries{}, err
+	}
+	return generatedQueries(
+		cgroup.CadvisorJob,
+		cgroup.CadvisorInstance,
+		fmt.Sprintf("id=~%s", promLabel(idPattern)),
+		window,
+		"cgroup",
+	)
+}
+
+// resolveSystemd maps a system unit and slice to one exact cgroup path. Exact
+// matching is intentional: cgroup metrics are hierarchical, so including both
+// a unit root and its child cgroups would double-count the same resources.
+func resolveSystemd(systemd *symbiontv1alpha1.SystemdSource, window string) (Queries, error) {
+	if !systemdUnitPattern.MatchString(systemd.Unit) {
+		return Queries{}, errors.New("systemd source requires a valid .service or .scope unit")
+	}
+	slice := systemd.Slice
+	if slice == "" {
+		slice = "system.slice"
+	}
+	if !systemdSlicePattern.MatchString(slice) {
+		return Queries{}, errors.New("systemd source requires a valid .slice name")
+	}
+	id := systemdSlicePath(slice) + "/" + systemd.Unit
+	return generatedQueries(
+		systemd.CadvisorJob,
+		systemd.CadvisorInstance,
+		fmt.Sprintf("id=%s", promLabel(id)),
+		window,
+		"systemd",
+	)
+}
+
+func generatedQueries(job, instance, idMatcher, window, source string) (Queries, error) {
 	if !windowPattern.MatchString(window) {
 		return Queries{}, fmt.Errorf("invalid metrics.window %q", window)
 	}
-
-	job := docker.CadvisorJob
 	if job == "" {
 		job = "cadvisor"
 	}
-	labelMatchers := fmt.Sprintf("job=%s", promLabel(job))
-	if docker.CadvisorInstance == "" {
-		return Queries{}, fmt.Errorf("docker source requires cadvisorInstance for per-node accounting")
+	if instance == "" {
+		return Queries{}, fmt.Errorf("%s source requires cadvisorInstance for per-node accounting", source)
 	}
-	labelMatchers += fmt.Sprintf(",instance=%s", promLabel(docker.CadvisorInstance))
-	matchers := "{" + labelMatchers + "," + dockerCgroupIDSelector + "}"
+	matchers := fmt.Sprintf("{job=%s,instance=%s,%s}", promLabel(job), promLabel(instance), idMatcher)
 
 	return Queries{
 		// Counters need rate() first, then sum across containers.
@@ -107,12 +165,59 @@ func resolveDocker(docker *symbiontv1alpha1.DockerSource, window string) (Querie
 	}, nil
 }
 
+func cgroupGlobRegex(glob string) (string, error) {
+	if len(glob) < 2 || len(glob) > 1024 || glob[0] != '/' || strings.HasSuffix(glob, "/") {
+		return "", errors.New("cgroup source requires an absolute non-root path glob")
+	}
+	if strings.Contains(glob, "**") {
+		return "", errors.New("cgroup pathGlob does not support recursive ** wildcards")
+	}
+	parts := strings.Split(glob[1:], "/")
+	if strings.ContainsAny(parts[0], "*?") {
+		return "", errors.New("cgroup pathGlob requires a literal top-level component")
+	}
+	if parts[0] == "kubepods" || strings.HasPrefix(parts[0], "kubepods.") {
+		return "", errors.New("cgroup pathGlob must not select the Kubernetes cgroup hierarchy")
+	}
+
+	var regex strings.Builder
+	regex.WriteByte('^')
+	for _, char := range glob {
+		switch char {
+		case '*':
+			regex.WriteString(`[^/]*`)
+		case '?':
+			regex.WriteString(`[^/]`)
+		default:
+			if char < 0x20 || char == 0x7f {
+				return "", errors.New("cgroup pathGlob contains a control character")
+			}
+			regex.WriteString(regexp.QuoteMeta(string(char)))
+		}
+	}
+	regex.WriteByte('$')
+	return regex.String(), nil
+}
+
+// systemdSlicePath expands systemd's dash-delimited slice hierarchy. For
+// example, media-services.slice maps to
+// /media.slice/media-services.slice.
+func systemdSlicePath(slice string) string {
+	stem := strings.TrimSuffix(slice, ".slice")
+	components := strings.Split(stem, "-")
+	var path strings.Builder
+	for i := range components {
+		path.WriteByte('/')
+		path.WriteString(strings.Join(components[:i+1], "-"))
+		path.WriteString(".slice")
+	}
+	return path.String()
+}
+
 // promLabel renders a Prometheus label value literal, escaping backslashes
 // and double quotes.
 func promLabel(v string) string {
-	escaped := strings.ReplaceAll(v, `\`, `\\`)
-	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
-	return `"` + escaped + `"`
+	return strconv.Quote(v)
 }
 
 // Client is a minimal Prometheus HTTP-API v1 client issuing instant queries.
@@ -121,18 +226,12 @@ type Client struct {
 	http    *http.Client
 }
 
-// NewClient builds a client against a Prometheus base URL such as
-// http://kube-prometheus-stack-prometheus.monitoring:9090.
-func NewClient(rawURL string, timeout time.Duration) (*Client, error) {
-	parsed, err := url.Parse(strings.TrimRight(rawURL, "/"))
+// NewClient builds a client only after the operator-owned destination policy
+// accepts the workload-supplied URL.
+func NewClient(rawURL string, timeout time.Duration, policy DestinationPolicy) (*Client, error) {
+	parsed, err := policy.Validate(rawURL)
 	if err != nil {
-		return nil, errors.New("invalid prometheusURL")
-	}
-	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Opaque != "" {
-		return nil, errors.New("invalid prometheusURL: absolute http(s) URL with a host required")
-	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return nil, errors.New("invalid prometheusURL: credentials, query parameters and fragments are not allowed")
+		return nil, err
 	}
 	if timeout <= 0 {
 		timeout = 10 * time.Second

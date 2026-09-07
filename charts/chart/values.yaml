@@ -104,6 +104,17 @@ manager:
   #   labels: {}
   #   annotations: {}
 
+## Restrict workload-supplied Prometheus URLs to operator-approved origins.
+## Matching is exact after normalizing scheme/host case, a DNS trailing dot,
+## IP spelling, and default ports (http=80, https=443). URL paths do not affect
+## the destination match. Use allowAny only when every ShadowWorkload author is
+## trusted to select any controller-reachable HTTP(S) backend.
+##
+prometheusDestinationPolicy:
+  allowedDestinations:
+    - http://kube-prometheus-stack-prometheus.monitoring:9090
+  allowAny: false
+
 ## RBAC configuration
 ##
 rbac:

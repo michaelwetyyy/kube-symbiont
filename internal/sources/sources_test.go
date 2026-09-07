@@ -27,19 +27,55 @@ import (
 	symbiontv1alpha1 "github.com/michaelwetyyy/kube-symbiont/api/v1alpha1"
 )
 
+const (
+	testNode             = "lab"
+	testPrometheusURL    = "http://prom:9090"
+	testCadvisorInstance = "192.0.2.10:4194"
+	testSystemdUnit      = "backup.service"
+)
+
 func dockerSpec(job, instance string) *symbiontv1alpha1.ShadowWorkloadSpec {
 	return &symbiontv1alpha1.ShadowWorkloadSpec{
-		Node: "lab",
+		Node: testNode,
 		Source: symbiontv1alpha1.SourceSpec{
 			Type:   symbiontv1alpha1.SourceTypeDocker,
 			Docker: &symbiontv1alpha1.DockerSource{Selector: symbiontv1alpha1.SelectorAll, CadvisorJob: job, CadvisorInstance: instance},
 		},
-		Metrics: symbiontv1alpha1.MetricsConfig{PrometheusURL: "http://prom:9090", Window: "5m"},
+		Metrics: symbiontv1alpha1.MetricsConfig{PrometheusURL: testPrometheusURL, Window: "5m"},
+	}
+}
+
+func cgroupSpec(glob, instance string) *symbiontv1alpha1.ShadowWorkloadSpec {
+	return &symbiontv1alpha1.ShadowWorkloadSpec{
+		Node: testNode,
+		Source: symbiontv1alpha1.SourceSpec{
+			Type: symbiontv1alpha1.SourceTypeCgroup,
+			Cgroup: &symbiontv1alpha1.CgroupSource{
+				PathGlob:         glob,
+				CadvisorInstance: instance,
+			},
+		},
+		Metrics: symbiontv1alpha1.MetricsConfig{PrometheusURL: testPrometheusURL, Window: "5m"},
+	}
+}
+
+func systemdSpec(unit, slice, instance string) *symbiontv1alpha1.ShadowWorkloadSpec {
+	return &symbiontv1alpha1.ShadowWorkloadSpec{
+		Node: testNode,
+		Source: symbiontv1alpha1.SourceSpec{
+			Type: symbiontv1alpha1.SourceTypeSystemd,
+			Systemd: &symbiontv1alpha1.SystemdSource{
+				Unit:             unit,
+				Slice:            slice,
+				CadvisorInstance: instance,
+			},
+		},
+		Metrics: symbiontv1alpha1.MetricsConfig{PrometheusURL: testPrometheusURL, Window: "5m"},
 	}
 }
 
 func TestResolveDockerGeneratesIDPrefixSelectors(t *testing.T) {
-	q, err := Resolve(dockerSpec("cadvisor", "192.0.2.10:4194"))
+	q, err := Resolve(dockerSpec("cadvisor", testCadvisorInstance))
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -57,7 +93,7 @@ func TestResolveDockerGeneratesIDPrefixSelectors(t *testing.T) {
 }
 
 func TestResolveDockerDefaultsJobAndRequiresInstance(t *testing.T) {
-	q, err := Resolve(dockerSpec("", "192.0.2.10:4194"))
+	q, err := Resolve(dockerSpec("", testCadvisorInstance))
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -73,12 +109,101 @@ func TestResolveDockerDefaultsJobAndRequiresInstance(t *testing.T) {
 }
 
 func TestResolveDockerEscapesLabelValues(t *testing.T) {
-	q, err := Resolve(dockerSpec(`my"job\`, "192.0.2.10:4194"))
+	q, err := Resolve(dockerSpec(`my"job\`, testCadvisorInstance))
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
 	if !strings.Contains(q.CPUCores, `job="my\"job\\"`) {
 		t.Errorf("label value not escaped: %s", q.CPUCores)
+	}
+}
+
+func TestResolveCgroupGeneratesAnchoredPathGlob(t *testing.T) {
+	q, err := Resolve(cgroupSpec("/system.slice/media-?.service", testCadvisorInstance))
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	wantMatcher := `job="cadvisor",instance="192.0.2.10:4194",id=~"^/system\\.slice/media-[^/]\\.service$"`
+	if !strings.Contains(q.CPUCores, wantMatcher) {
+		t.Errorf("cgroup matcher not safely translated: %s", q.CPUCores)
+	}
+	if !strings.Contains(q.CPUCores, "[5m]") || !strings.Contains(q.MemoryBytes, "[5m]") {
+		t.Errorf("window not injected: %s | %s", q.CPUCores, q.MemoryBytes)
+	}
+}
+
+func TestResolveCgroupRejectsUnsafeGlobs(t *testing.T) {
+	tests := []string{
+		"/",
+		"relative/path",
+		"/*/service",
+		"/system.slice/**/service",
+		"/kubepods.slice/*",
+		"/kubepods/burstable/*",
+		"/system.slice/service/",
+		"/system.slice/bad\nservice",
+	}
+	for _, glob := range tests {
+		t.Run(glob, func(t *testing.T) {
+			if _, err := Resolve(cgroupSpec(glob, testCadvisorInstance)); err == nil {
+				t.Fatalf("unsafe cgroup path glob %q was accepted", glob)
+			}
+		})
+	}
+	if _, err := Resolve(cgroupSpec("/system.slice/*.service", "")); err == nil {
+		t.Fatal("omitted instance must be rejected to prevent cross-node aggregation")
+	}
+}
+
+func TestResolveSystemdGeneratesExactUnitPath(t *testing.T) {
+	tests := []struct {
+		name   string
+		unit   string
+		slice  string
+		wantID string
+	}{
+		{name: "default system slice", unit: "plexmediaserver.service", wantID: "/system.slice/plexmediaserver.service"},
+		{name: "nested slice", unit: "transcoder@primary.service", slice: "media-services.slice", wantID: "/media.slice/media-services.slice/transcoder@primary.service"},
+		{name: "scope", unit: "backup.scope", slice: "maintenance.slice", wantID: "/maintenance.slice/backup.scope"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			q, err := Resolve(systemdSpec(tt.unit, tt.slice, testCadvisorInstance))
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			wantMatcher := `id="` + tt.wantID + `"`
+			if !strings.Contains(q.CPUCores, wantMatcher) {
+				t.Errorf("systemd unit did not resolve exactly: %s", q.CPUCores)
+			}
+			if strings.Contains(q.CPUCores, `id=~`) {
+				t.Errorf("systemd selector must not be a regex: %s", q.CPUCores)
+			}
+		})
+	}
+}
+
+func TestResolveSystemdRejectsInvalidUnitsAndTargets(t *testing.T) {
+	tests := []struct {
+		name     string
+		unit     string
+		slice    string
+		instance string
+	}{
+		{name: "unsupported timer", unit: "backup.timer", instance: testCadvisorInstance},
+		{name: "path injection", unit: "../backup.service", instance: testCadvisorInstance},
+		{name: "unit path", unit: "system.slice/backup.service", instance: testCadvisorInstance},
+		{name: "invalid slice", unit: testSystemdUnit, slice: "../system.slice", instance: testCadvisorInstance},
+		{name: "empty slice hierarchy component", unit: testSystemdUnit, slice: "media--services.slice", instance: testCadvisorInstance},
+		{name: "missing instance", unit: testSystemdUnit},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := Resolve(systemdSpec(tt.unit, tt.slice, tt.instance)); err == nil {
+				t.Fatalf("invalid systemd source was accepted: unit=%q slice=%q", tt.unit, tt.slice)
+			}
+		})
 	}
 }
 
@@ -91,7 +216,7 @@ func TestResolvePromQLPassthrough(t *testing.T) {
 				MemoryBytes: `sum(node_memory_Active_bytes)`,
 			},
 		},
-		Metrics: symbiontv1alpha1.MetricsConfig{PrometheusURL: "http://prom:9090", Window: "5m"},
+		Metrics: symbiontv1alpha1.MetricsConfig{PrometheusURL: testPrometheusURL, Window: "5m"},
 	}
 	q, err := Resolve(spec)
 	if err != nil {
@@ -109,6 +234,19 @@ func TestResolveErrors(t *testing.T) {
 	}
 	if _, err := Resolve(dangling); err == nil {
 		t.Error("docker type without block should error")
+	}
+	if _, err := Resolve(nil); err == nil {
+		t.Error("nil spec should error")
+	}
+	for _, sourceType := range []symbiontv1alpha1.SourceType{
+		symbiontv1alpha1.SourceTypeCgroup,
+		symbiontv1alpha1.SourceTypeSystemd,
+		symbiontv1alpha1.SourceTypePromQL,
+	} {
+		missing := &symbiontv1alpha1.ShadowWorkloadSpec{Source: symbiontv1alpha1.SourceSpec{Type: sourceType}}
+		if _, err := Resolve(missing); err == nil {
+			t.Errorf("%s type without block should error", sourceType)
+		}
 	}
 	badWindow := dockerSpec("cadvisor", "")
 	badWindow.Metrics.Window = "bogus"
@@ -200,7 +338,7 @@ func TestClientQuery(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			srv := httptest.NewServer(tt.handler)
 			defer srv.Close()
-			c, err := NewClient(srv.URL, 0)
+			c, err := NewClient(srv.URL, 0, DestinationPolicy{allowAny: true})
 			if err != nil {
 				t.Fatalf("NewClient: %v", err)
 			}
@@ -235,7 +373,7 @@ func TestQueryPairCombines(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	c, _ := NewClient(srv.URL, 0)
+	c, _ := NewClient(srv.URL, 0, DestinationPolicy{allowAny: true})
 	cpu, mem, found, err := c.QueryPair(context.Background(), Queries{CPUCores: "cpu", MemoryBytes: "mem"})
 	if err != nil {
 		t.Fatalf("QueryPair: %v", err)
@@ -254,7 +392,7 @@ func TestNewClientValidation(t *testing.T) {
 		"http://prom:9090#fragment",
 	}
 	for _, rawURL := range bad {
-		if _, err := NewClient(rawURL, 0); err == nil {
+		if _, err := NewClient(rawURL, 0, DestinationPolicy{allowAny: true}); err == nil {
 			t.Errorf("NewClient(%q) should reject unsafe URL shape", rawURL)
 		}
 	}
@@ -271,7 +409,7 @@ func TestClientRejectsRedirectWithoutLeakingDestination(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClient(srv.URL, 0)
+	c, err := NewClient(srv.URL, 0, DestinationPolicy{allowAny: true})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -289,7 +427,7 @@ func TestMultiSampleClassifiesViaSentinel(t *testing.T) {
 		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"1"]},{"value":[0,"2"]}]}}`))
 	}))
 	defer srv.Close()
-	c, err := NewClient(srv.URL, 0)
+	c, err := NewClient(srv.URL, 0, DestinationPolicy{allowAny: true})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

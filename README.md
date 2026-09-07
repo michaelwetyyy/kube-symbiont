@@ -60,8 +60,17 @@ Exactly one source per ShadowWorkload; each resolves to a CPU-cores + memory-byt
   k8s pods by cgroup **id prefix**: `id=~"/system.slice/docker-.*"` on the standalone
   cAdvisor job. (Image-label matching was refuted by measurement: cAdvisor monitors the whole
   cgroup tree and k8s pod series carry `image` labels too.)
+- **`cgroup`** — selects one or more cAdvisor cgroup `id` paths with a constrained path glob.
+  The first path component must be literal; `*` and `?` match only within one component, and
+  recursive `**` is rejected. The Kubernetes `kubepods` hierarchy is rejected to prevent
+  double-reserving resources already visible to the scheduler.
+- **`systemd`** — resolves one system `.service` or `.scope` unit to its exact cgroup path.
+  `system.slice` is the default; nested slices such as `media-services.slice` are expanded to
+  `/media.slice/media-services.slice`. Exact matching avoids double-counting descendant cgroups.
 - **`promql`** — raw CPU/memory query passthrough; escape hatch for anything else.
-- *(v0.2 planned: `cgroup` path globs and `systemd` unit sources.)*
+
+All generated source types require `cadvisorInstance`, even when the Prometheus job has only one
+current target. This per-node pin is a correctness boundary for future multi-node deployments.
 
 ## Quickstart
 
@@ -88,6 +97,23 @@ kubectl apply -f https://github.com/michaelwetyyy/kube-symbiont/releases/downloa
 helm upgrade --install kube-symbiont ./charts/chart \
   --namespace kube-symbiont-system --create-namespace
 ```
+
+The manager, rather than each `ShadowWorkload`, owns the Prometheus egress
+boundary. The shipped manifests allow the example backend origin
+`http://kube-prometheus-stack-prometheus.monitoring:9090`. Declare every other
+backend explicitly with a repeated manager argument:
+
+```sh
+--prometheus-allowed-destination=https://prometheus.example:9090
+```
+
+For Helm, set `prometheusDestinationPolicy.allowedDestinations`. Rules are exact
+HTTP(S) origins: scheme, hostname and effective port must match; a URL path is
+permitted because it does not change the network destination. An empty list
+denies all destinations. Existing installations whose `ShadowWorkload` authors
+are fully trusted can deliberately retain the old behavior with
+`prometheusDestinationPolicy.allowAny=true` (or
+`--prometheus-allow-any-destination`), but it cannot be combined with rules.
 
 The manager always needs a minimal ClusterRole: ShadowWorkloads are namespaced,
 but their node-eligibility and ballast-priority gates read cluster-scoped Nodes
@@ -137,6 +163,33 @@ source:
     memoryBytes: 'sum(avg_over_time(container_memory_working_set_bytes{id=~"/system.slice/docker-.*"}[5m]))'
 ```
 
+Cgroup path-glob alternative (matches units directly below `system.slice`):
+
+```yaml
+source:
+  type: cgroup
+  cgroup:
+    pathGlob: /system.slice/media-*.service
+    cadvisorJob: cadvisor
+    cadvisorInstance: "192.0.2.10:4194"
+```
+
+Systemd unit alternative:
+
+```yaml
+source:
+  type: systemd
+  systemd:
+    unit: plexmediaserver.service
+    slice: system.slice
+    cadvisorJob: cadvisor
+    cadvisorInstance: "192.0.2.10:4194"
+```
+
+The systemd source is for system-manager services and scopes. For user-manager units, escaped
+unit names, or another hierarchy, use the `cgroup` source with the cgroup `id` path observed in
+cAdvisor. Use the `promql` escape hatch only when the typed selectors cannot represent the source.
+
 Behaviour on rough edges: workload off or emitting nothing → phantom settles on the floor;
 brief spikes → absorbed by the moving average; phantom deleted externally → recreated;
 in-place resize rejected → phantom keeps previous requests and the CR reports a `Degraded`
@@ -168,11 +221,12 @@ make manifests generate   # regenerate CRDs/RBAC/deepcopy after API edits
 - **Trusted configuration boundary.** A `ShadowWorkload` author selects the Prometheus URL and,
   for raw `promql`, the query. Grant CR write access only to trusted operators; do not expose it
   as an untrusted multi-tenant API. Write access is effectively node-capacity-administrator access:
-  it can create or resize scheduler-visible reservations on a chosen node and select a network
-  destination reachable by the controller. The client rejects embedded credentials, URL query/fragment
-  data and redirects, bounds response size, and never persists backend response bodies or transport
-  destinations in status/events. It does not yet enforce an operator-level destination allowlist;
-  a trusted author can still select another directly reachable HTTP(S) host.
+  it can create or resize scheduler-visible reservations on a chosen node. The manager's exact-origin
+  allowlist prevents authors from selecting an undeclared network destination; the client also rejects
+  embedded credentials, URL query/fragment data and redirects, bounds response size, and never persists
+  backend response bodies or transport destinations in status/events. Host rules are checked before DNS
+  resolution, so use egress NetworkPolicy or an equivalent network control when DNS rebinding or allowed
+  destination compromise is in scope. `allowAny` deliberately restores the old trusted-author behavior.
 - **Single-node targeting.** Each ShadowWorkload pins one node; multi-host bare metal means
   one resource per host.
 

@@ -73,6 +73,30 @@ func assertVersionedManagerImage(t *testing.T, obj *unstructured.Unstructured) {
 	}
 }
 
+func assertPrometheusDestinationPolicy(t *testing.T, obj *unstructured.Unstructured) {
+	t.Helper()
+	containers, _, err := unstructured.NestedSlice(obj.Object,
+		"spec", "template", "spec", "containers")
+	if err != nil || len(containers) == 0 {
+		t.Fatalf("deployment has no manager container: %v", err)
+	}
+	container, ok := containers[0].(map[string]any)
+	if !ok {
+		t.Fatalf("manager container has unexpected shape %T", containers[0])
+	}
+	args, ok := container["args"].([]any)
+	if !ok {
+		t.Fatalf("manager args have unexpected shape %T", container["args"])
+	}
+	want := "--prometheus-allowed-destination=http://kube-prometheus-stack-prometheus.monitoring:9090"
+	for _, arg := range args {
+		if arg == want {
+			return
+		}
+	}
+	t.Errorf("installer manager does not declare default Prometheus destination %q", want)
+}
+
 func assertBindingNamespaces(t *testing.T, key string, obj *unstructured.Unstructured) {
 	t.Helper()
 	subjects, _, err := unstructured.NestedSlice(obj.Object, "subjects")
@@ -113,6 +137,7 @@ func TestInstallerContainsCoherentFreshInstall(t *testing.T) {
 		if obj.GetKind() == "Deployment" && obj.GetName() == "kube-symbiont-controller-manager" {
 			deploymentIndex = i
 			assertVersionedManagerImage(t, obj)
+			assertPrometheusDestinationPolicy(t, obj)
 		}
 		if ns := obj.GetNamespace(); ns != "" && ns != systemNamespace {
 			t.Errorf("%s uses namespace %q, want %q", key, ns, systemNamespace)

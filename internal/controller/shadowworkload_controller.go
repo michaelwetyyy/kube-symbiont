@@ -82,6 +82,9 @@ type ShadowWorkloadReconciler struct {
 	// QuerierFor builds a metrics querier for a Prometheus URL. Defaults to
 	// sources.NewClient; overridable for tests.
 	QuerierFor func(rawURL string) (MetricsQuerier, error)
+	// PrometheusDestinationPolicy is immutable manager-owned configuration.
+	// Its zero value fails closed when no destinations were declared.
+	PrometheusDestinationPolicy sources.DestinationPolicy
 
 	// Metrics instruments the measure → clamp → resize loop on the manager's
 	// Prometheus registry. Nil-safe: every call is a no-op until
@@ -559,7 +562,7 @@ func (r *ShadowWorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	if r.QuerierFor == nil {
 		r.QuerierFor = func(rawURL string) (MetricsQuerier, error) {
-			return sources.NewClient(rawURL, queryTimeout)
+			return sources.NewClient(rawURL, queryTimeout, r.PrometheusDestinationPolicy)
 		}
 	}
 	if r.Metrics == nil {

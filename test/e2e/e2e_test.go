@@ -184,7 +184,10 @@ spec:
       cpuCores: vector(0.1)
       memoryBytes: vector(33554432)
   metrics:
-    prometheusURL: http://prometheus-does-not-exist.invalid:9090
+    # This is the shipped default allowed origin. Kind deliberately has no
+    # Prometheus Service, so the test still exercises backend unavailability
+    # without bypassing the destination policy it is meant to validate.
+    prometheusURL: http://kube-prometheus-stack-prometheus.monitoring:9090
     window: 5m
   update:
     deltaThresholdPercent: 10

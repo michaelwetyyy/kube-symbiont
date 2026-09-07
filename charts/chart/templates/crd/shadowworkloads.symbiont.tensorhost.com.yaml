@@ -79,7 +79,8 @@ spec:
                   window:
                     description: |-
                       window is the range window the controller injects into generated
-                      queries (docker source) — the smoothing horizon of the moving average.
+                      queries (docker, cgroup and systemd sources) — the smoothing horizon of
+                      the moving average.
                       promql passthrough embeds its own ranges; window still documents the
                       intended smoothing horizon.
                     pattern: ^([0-9]+(\.[0-9]+)?(ms|s|m|h))+$
@@ -101,6 +102,45 @@ spec:
                   source declares what to measure on that node. Exactly one source block
                   must be set and it must match type.
                 properties:
+                  cgroup:
+                    description: |-
+                      cgroup shadows cgroups selected by an absolute path glob in cAdvisor's
+                      id label. Required when type is cgroup.
+                    properties:
+                      cadvisorInstance:
+                        description: |-
+                          cadvisorInstance pins the selector to one standalone cAdvisor target.
+                          It is required so a multi-target job cannot aggregate another node into
+                          this node's scheduler reservation.
+                        minLength: 1
+                        type: string
+                      cadvisorJob:
+                        default: cadvisor
+                        description: |-
+                          cadvisorJob is the Prometheus job label emitted by the standalone
+                          cAdvisor instance monitoring this node.
+                        type: string
+                      pathGlob:
+                        description: |-
+                          pathGlob selects one or more cAdvisor cgroup id paths. It must name a
+                          literal non-kubepods top-level cgroup. '*' matches zero or more characters
+                          and '?' matches one character within a path component. Recursive '**'
+                          matching is intentionally unsupported.
+                        maxLength: 1024
+                        minLength: 2
+                        pattern: ^/[-A-Za-z0-9_.:@%+=,~]+(/[-A-Za-z0-9_.:@%+=,~*?]+)*$
+                        type: string
+                    required:
+                    - cadvisorInstance
+                    - pathGlob
+                    type: object
+                    x-kubernetes-validations:
+                    - message: cgroup.pathGlob does not support recursive ** wildcards
+                      rule: '!self.pathGlob.contains(''**'')'
+                    - message: cgroup.pathGlob must not select the Kubernetes cgroup
+                        hierarchy
+                      rule: '!(self.pathGlob == ''/kubepods'' || self.pathGlob.startsWith(''/kubepods/'')
+                        || self.pathGlob.startsWith(''/kubepods.''))'
                   docker:
                     description: |-
                       docker shadows Docker containers running directly on the node
@@ -157,21 +197,68 @@ spec:
                     - cpuCores
                     - memoryBytes
                     type: object
+                  systemd:
+                    description: |-
+                      systemd shadows one system service or scope in a named systemd slice.
+                      Required when type is systemd.
+                    properties:
+                      cadvisorInstance:
+                        description: |-
+                          cadvisorInstance pins the selector to one standalone cAdvisor target.
+                          It is required so a multi-target job cannot aggregate another node into
+                          this node's scheduler reservation.
+                        minLength: 1
+                        type: string
+                      cadvisorJob:
+                        default: cadvisor
+                        description: |-
+                          cadvisorJob is the Prometheus job label emitted by the standalone
+                          cAdvisor instance monitoring this node.
+                        type: string
+                      slice:
+                        default: system.slice
+                        description: |-
+                          slice is the systemd system slice containing unit. Nested slice names
+                          such as media-services.slice are expanded to their cgroup hierarchy.
+                        maxLength: 255
+                        minLength: 7
+                        pattern: ^[A-Za-z0-9_.]+(-[A-Za-z0-9_.]+)*[.]slice$
+                        type: string
+                      unit:
+                        description: unit is the systemd .service or .scope unit to
+                          measure.
+                        maxLength: 255
+                        minLength: 7
+                        pattern: ^[A-Za-z0-9_.:@-]+[.](service|scope)$
+                        type: string
+                    required:
+                    - cadvisorInstance
+                    - unit
+                    type: object
                   type:
                     description: type selects the source implementation to resolve.
                     enum:
                     - docker
+                    - cgroup
+                    - systemd
                     - promql
                     type: string
                 required:
                 - type
                 type: object
                 x-kubernetes-validations:
-                - message: exactly one of source.docker or source.promql must be set
-                  rule: '[has(self.docker), has(self.promql)].filter(x, x).size()
-                    == 1'
+                - message: exactly one of source.docker, source.cgroup, source.systemd
+                    or source.promql must be set
+                  rule: '[has(self.docker), has(self.cgroup), has(self.systemd), has(self.promql)].filter(x,
+                    x).size() == 1'
                 - message: source.type must match the configured source block
                   rule: (self.type == 'docker') == has(self.docker)
+                - message: source.type must match the configured source block
+                  rule: (self.type == 'cgroup') == has(self.cgroup)
+                - message: source.type must match the configured source block
+                  rule: (self.type == 'systemd') == has(self.systemd)
+                - message: source.type must match the configured source block
+                  rule: (self.type == 'promql') == has(self.promql)
               update:
                 description: update controls when observed drift turns into a phantom
                   resize.
@@ -254,6 +341,19 @@ spec:
                 - floor
                 - pollInterval
                 type: object
+                x-kubernetes-validations:
+                - message: update.floor.cpu must be non-negative
+                  rule: '!quantity(self.floor.cpu).isLessThan(quantity(''0''))'
+                - message: update.floor.memory must be non-negative
+                  rule: '!quantity(self.floor.memory).isLessThan(quantity(''0''))'
+                - message: update.ceiling.cpu must be non-negative
+                  rule: '!quantity(self.ceiling.cpu).isLessThan(quantity(''0''))'
+                - message: update.ceiling.memory must be non-negative
+                  rule: '!quantity(self.ceiling.memory).isLessThan(quantity(''0''))'
+                - message: update.floor.cpu must not exceed update.ceiling.cpu
+                  rule: '!quantity(self.ceiling.cpu).isLessThan(quantity(self.floor.cpu))'
+                - message: update.floor.memory must not exceed update.ceiling.memory
+                  rule: '!quantity(self.ceiling.memory).isLessThan(quantity(self.floor.memory))'
             required:
             - metrics
             - node
