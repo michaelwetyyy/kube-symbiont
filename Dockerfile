@@ -29,7 +29,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
 FROM gcr.io/distroless/static:nonroot@sha256:1c2c046bc09ed40fad370b599a0b1ae7987f55b01e247cf27a7c27cd97e5bbc7
 ARG VERSION=dev
 ARG VCS_REF=unknown
-LABEL org.opencontainers.image.title="kube-symbiont" \
+LABEL org.opencontainers.image.title="Symbiont" \
       org.opencontainers.image.description="Experimental Kubernetes operator for scheduler-visible bare-metal resource accounting" \
       org.opencontainers.image.source="https://github.com/michaelwetyyy/kube-symbiont" \
       org.opencontainers.image.licenses="Apache-2.0" \

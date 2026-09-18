@@ -1,4 +1,6 @@
-# kube-symbiont
+# Symbiont
+> **Technical identity:** the repository, Go module, Helm release and Kubernetes runtime identifiers remain `kube-symbiont` for compatibility. **Symbiont** is the project name.
+
 
 > **Status: experimental.** The phantom-pod mechanism below is a homelab capstone
 > experiment, not a production pattern. Validate its scheduling behaviour on a
@@ -8,7 +10,7 @@
 A Kubernetes operator that makes **bare-metal resource usage visible to the scheduler**.
 Processes running alongside a cluster outside Kubernetes — game servers under Pterodactyl/Wings,
 Docker daemons, systemd services — contribute **zero** to the scheduler's capacity math,
-which silently over-commits nodes. kube-symbiont maintains one "phantom pod" per bare-metal
+which silently over-commits nodes. Symbiont maintains one "phantom pod" per bare-metal
 workload whose resource *requests* mirror that workload's measured CPU/RAM, so the scheduler
 accounts for capacity it cannot otherwise see.
 
@@ -26,7 +28,7 @@ Pod, so it sums as zero. The kernel *does* see the bare-metal process, but only 
 (eviction manager / OOM killer), i.e. after the node is already starving. The failure mode:
 the scheduler keeps packing pods because the ledger looks fine, then eviction fires.
 
-kube-symbiont is the dynamic, per-workload version of `system-reserved`: it measures the
+Symbiont is the dynamic, per-workload version of `system-reserved`: it measures the
 real footprint via Prometheus and injects it into the ledger as phantom-pod requests.
 
 ## How the phantom works

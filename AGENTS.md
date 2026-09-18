@@ -1,4 +1,4 @@
-# kube-symbiont - AI Agent Guide
+# Symbiont (`kube-symbiont`) - AI Agent Guide
 
 ## Project Structure
 

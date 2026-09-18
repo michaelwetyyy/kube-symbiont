@@ -93,7 +93,7 @@ func main() {
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	if showVersion {
-		fmt.Printf("kube-symbiont %s (%s)\n", version, commit)
+		fmt.Printf("Symbiont %s (%s)\n", version, commit)
 		return
 	}
 
