@@ -301,3 +301,56 @@ func TestMultiSampleClassifiesViaSentinel(t *testing.T) {
 		t.Fatalf("QueryPair error must wrap ErrMultiSample for bounded failure classification: %v", err)
 	}
 }
+
+func TestResolveSystemdGeneratesExactCgroupSelector(t *testing.T) {
+	spec := &symbiontv1alpha1.ShadowWorkloadSpec{
+		Source: symbiontv1alpha1.SourceSpec{
+			Type:    symbiontv1alpha1.SourceTypeSystemd,
+			Systemd: &symbiontv1alpha1.SystemdSource{Unit: "minecraft.service", CadvisorJob: "cadvisor-host", CadvisorInstance: "192.168.1.124:4194"},
+		},
+		Metrics: symbiontv1alpha1.MetricsConfig{Window: "5m"},
+	}
+	q, err := Resolve(spec)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	want := `job="cadvisor-host",instance="192.168.1.124:4194",id="/system.slice/minecraft.service"`
+	if !strings.Contains(q.CPUCores, want) || !strings.Contains(q.MemoryBytes, want) {
+		t.Fatalf("systemd matcher missing: %+v", q)
+	}
+}
+
+func TestResolveCgroupGlobIsAnchoredAndEscaped(t *testing.T) {
+	spec := &symbiontv1alpha1.ShadowWorkloadSpec{
+		Source: symbiontv1alpha1.SourceSpec{
+			Type:   symbiontv1alpha1.SourceTypeCgroup,
+			Cgroup: &symbiontv1alpha1.CgroupSource{Path: "/system.slice/worker-*.scope", CadvisorInstance: "192.0.2.10:4194"},
+		},
+		Metrics: symbiontv1alpha1.MetricsConfig{Window: "2m"},
+	}
+	q, err := Resolve(spec)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !strings.Contains(q.CPUCores, `id=~"^/system\\.slice/worker-[^/]*\\.scope$"`) {
+		t.Fatalf("glob matcher not safely anchored/escaped: %s", q.CPUCores)
+	}
+	if !strings.Contains(q.CPUCores, `job="cadvisor"`) || !strings.Contains(q.CPUCores, `[2m]`) {
+		t.Fatalf("defaults/window missing: %s", q.CPUCores)
+	}
+}
+
+func TestResolveTypedHostSourcesRejectUnsafeInputs(t *testing.T) {
+	tests := []symbiontv1alpha1.SourceSpec{
+		{Type: symbiontv1alpha1.SourceTypeSystemd, Systemd: &symbiontv1alpha1.SystemdSource{Unit: "../minecraft.service", CadvisorInstance: "x"}},
+		{Type: symbiontv1alpha1.SourceTypeSystemd, Systemd: &symbiontv1alpha1.SystemdSource{Unit: "minecraft.service", CadvisorInstance: ""}},
+		{Type: symbiontv1alpha1.SourceTypeCgroup, Cgroup: &symbiontv1alpha1.CgroupSource{Path: "/system.slice//bad.service", CadvisorInstance: "x"}},
+		{Type: symbiontv1alpha1.SourceTypeCgroup, Cgroup: &symbiontv1alpha1.CgroupSource{Path: "/system.slice/x.service", CadvisorInstance: ""}},
+	}
+	for i, source := range tests {
+		spec := &symbiontv1alpha1.ShadowWorkloadSpec{Source: source, Metrics: symbiontv1alpha1.MetricsConfig{Window: "5m"}}
+		if _, err := Resolve(spec); err == nil {
+			t.Errorf("case %d: expected error", i)
+		}
+	}
+}

@@ -131,6 +131,7 @@ func makeTestNode(name string, ready *corev1.ConditionStatus) *corev1.Node {
 const (
 	testNodeName        = "lab"
 	terminatingNodeName = "doomed"
+	testCadvisorTarget  = "192.0.2.10:4194"
 )
 
 var readyTrue = corev1.ConditionTrue
@@ -152,7 +153,7 @@ func validShadowWorkload(name string) *symbiontv1alpha1.ShadowWorkload {
 			Node: testNodeName,
 			Source: symbiontv1alpha1.SourceSpec{
 				Type:   symbiontv1alpha1.SourceTypeDocker,
-				Docker: &symbiontv1alpha1.DockerSource{Selector: symbiontv1alpha1.SelectorAll, CadvisorInstance: "192.0.2.10:4194"},
+				Docker: &symbiontv1alpha1.DockerSource{Selector: symbiontv1alpha1.SelectorAll, CadvisorInstance: testCadvisorTarget},
 			},
 			Metrics: symbiontv1alpha1.MetricsConfig{
 				PrometheusURL: "http://prometheus.monitoring:9090",
@@ -253,6 +254,25 @@ var _ = Describe("ShadowWorkload Controller", func() {
 	It("should reject a source spec violating the one-of constraint", func() {
 		bad := validShadowWorkload("bad-oneof")
 		bad.Spec.Source.Docker = nil // type=docker with no docker block
+		err := k8sClient.Create(ctx, bad)
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsInvalid(err)).To(BeTrue())
+	})
+
+	It("should admit typed systemd source and reject mismatched source blocks", func() {
+		good := validShadowWorkload("systemd-source")
+		good.Spec.Source = symbiontv1alpha1.SourceSpec{
+			Type:    symbiontv1alpha1.SourceTypeSystemd,
+			Systemd: &symbiontv1alpha1.SystemdSource{Unit: "minecraft.service", CadvisorInstance: testCadvisorTarget},
+		}
+		Expect(k8sClient.Create(ctx, good)).To(Succeed())
+		deleteAndWait(good)
+
+		bad := validShadowWorkload("systemd-mismatch")
+		bad.Spec.Source = symbiontv1alpha1.SourceSpec{
+			Type:   symbiontv1alpha1.SourceTypeSystemd,
+			Cgroup: &symbiontv1alpha1.CgroupSource{Path: "/system.slice/minecraft.service", CadvisorInstance: testCadvisorTarget},
+		}
 		err := k8sClient.Create(ctx, bad)
 		Expect(err).To(HaveOccurred())
 		Expect(apierrors.IsInvalid(err)).To(BeTrue())

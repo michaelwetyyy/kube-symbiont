@@ -52,6 +52,8 @@ const dockerCgroupIDSelector = `id=~"/system.slice/docker-.*"`
 // windowPattern mirrors the CRD validation pattern for range windows;
 // re-validated here so generated queries can never embed arbitrary strings.
 var windowPattern = regexp.MustCompile(`^([0-9]+(\.[0-9]+)?(ms|s|m|h))+$`)
+var systemdUnitPattern = regexp.MustCompile(`^[A-Za-z0-9_.:@\-]+\.(service|scope|slice)$`)
+var cgroupPathPattern = regexp.MustCompile(`^/[A-Za-z0-9_.:@\-/*]+$`)
 
 // ErrMultiSample marks a query that resolved to more than one vector sample.
 // Callers classify it with errors.Is instead of parsing error text, keeping
@@ -74,6 +76,16 @@ func Resolve(spec *symbiontv1alpha1.ShadowWorkloadSpec) (Queries, error) {
 			CPUCores:    spec.Source.PromQL.CPUCores,
 			MemoryBytes: spec.Source.PromQL.MemoryBytes,
 		}, nil
+	case symbiontv1alpha1.SourceTypeCgroup:
+		if spec.Source.Cgroup == nil {
+			return Queries{}, fmt.Errorf("source type %q requires source.cgroup", spec.Source.Type)
+		}
+		return resolveCgroup(spec.Source.Cgroup, spec.Metrics.Window)
+	case symbiontv1alpha1.SourceTypeSystemd:
+		if spec.Source.Systemd == nil {
+			return Queries{}, fmt.Errorf("source type %q requires source.systemd", spec.Source.Type)
+		}
+		return resolveSystemd(spec.Source.Systemd, spec.Metrics.Window)
 	default:
 		return Queries{}, fmt.Errorf("unsupported source type %q", spec.Source.Type)
 	}
@@ -83,6 +95,46 @@ func Resolve(spec *symbiontv1alpha1.ShadowWorkloadSpec) (Queries, error) {
 // cadvisor job (and instance when pinned). selector "all" shadows every
 // bare-metal Docker container on the node; it is currently the only value the
 // API admits for v0.1.
+func resolveSystemd(systemd *symbiontv1alpha1.SystemdSource, window string) (Queries, error) {
+	if !systemdUnitPattern.MatchString(systemd.Unit) {
+		return Queries{}, fmt.Errorf("invalid systemd unit %q", systemd.Unit)
+	}
+	return resolveHostCgroup("/system.slice/"+systemd.Unit, false, systemd.CadvisorJob, systemd.CadvisorInstance, window)
+}
+
+func resolveCgroup(cgroup *symbiontv1alpha1.CgroupSource, window string) (Queries, error) {
+	if !cgroupPathPattern.MatchString(cgroup.Path) || strings.Contains(cgroup.Path, "//") {
+		return Queries{}, fmt.Errorf("invalid cgroup path %q", cgroup.Path)
+	}
+	return resolveHostCgroup(cgroup.Path, strings.Contains(cgroup.Path, "*"), cgroup.CadvisorJob, cgroup.CadvisorInstance, window)
+}
+
+func resolveHostCgroup(path string, glob bool, job, instance, window string) (Queries, error) {
+	if !windowPattern.MatchString(window) {
+		return Queries{}, fmt.Errorf("invalid metrics.window %q", window)
+	}
+	if instance == "" {
+		return Queries{}, errors.New("host source requires cadvisorInstance for per-node accounting")
+	}
+	if job == "" {
+		job = "cadvisor"
+	}
+	labelMatchers := fmt.Sprintf("job=%s,instance=%s", promLabel(job), promLabel(instance))
+	var idMatcher string
+	if glob {
+		quoted := regexp.QuoteMeta(path)
+		quoted = strings.ReplaceAll(quoted, `\*`, `[^/]*`)
+		idMatcher = fmt.Sprintf(`id=~%s`, promLabel("^"+quoted+"$"))
+	} else {
+		idMatcher = fmt.Sprintf("id=%s", promLabel(path))
+	}
+	matchers := "{" + labelMatchers + "," + idMatcher + "}"
+	return Queries{
+		CPUCores:    fmt.Sprintf("sum(rate(container_cpu_usage_seconds_total%s[%s]))", matchers, window),
+		MemoryBytes: fmt.Sprintf("sum(avg_over_time(container_memory_working_set_bytes%s[%s]))", matchers, window),
+	}, nil
+}
+
 func resolveDocker(docker *symbiontv1alpha1.DockerSource, window string) (Queries, error) {
 	if !windowPattern.MatchString(window) {
 		return Queries{}, fmt.Errorf("invalid metrics.window %q", window)
