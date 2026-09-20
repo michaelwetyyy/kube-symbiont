@@ -24,8 +24,7 @@ import (
 
 // SourceType selects which bare-metal source a ShadowWorkload measures.
 //
-// v0.1 implements docker and promql; cgroup and systemd arrive in v0.2.
-// +kubebuilder:validation:Enum=docker;promql
+// +kubebuilder:validation:Enum=docker;promql;cgroup;systemd
 type SourceType string
 
 const (
@@ -37,6 +36,12 @@ const (
 	// Prometheus. Escape hatch for anything the typed sources cannot
 	// express.
 	SourceTypePromQL SourceType = "promql"
+
+	// SourceTypeCgroup shadows one cgroup path or a bounded cgroup path glob.
+	SourceTypeCgroup SourceType = "cgroup"
+
+	// SourceTypeSystemd shadows one systemd unit through its cgroup path.
+	SourceTypeSystemd SourceType = "systemd"
 )
 
 const (
@@ -78,8 +83,8 @@ type ShadowWorkloadSpec struct {
 }
 
 // SourceSpec is a one-of container selecting the measured bare-metal source.
-// +kubebuilder:validation:XValidation:rule="[has(self.docker), has(self.promql)].filter(x, x).size() == 1",message="exactly one of source.docker or source.promql must be set"
-// +kubebuilder:validation:XValidation:rule="(self.type == 'docker') == has(self.docker)",message="source.type must match the configured source block"
+// +kubebuilder:validation:XValidation:rule="[has(self.docker), has(self.promql), has(self.cgroup), has(self.systemd)].filter(x, x).size() == 1",message="exactly one source block must be set"
+// +kubebuilder:validation:XValidation:rule="(self.type == 'docker') == has(self.docker) && (self.type == 'promql') == has(self.promql) && (self.type == 'cgroup') == has(self.cgroup) && (self.type == 'systemd') == has(self.systemd)",message="source.type must match the configured source block"
 type SourceSpec struct {
 	// type selects the source implementation to resolve.
 	Type SourceType `json:"type"`
@@ -95,6 +100,14 @@ type SourceSpec struct {
 	// aggregation (use sum()).
 	// +optional
 	PromQL *PromQLSource `json:"promql,omitempty"`
+
+	// cgroup shadows a cgroup path (or bounded glob) from standalone cAdvisor.
+	// +optional
+	Cgroup *CgroupSource `json:"cgroup,omitempty"`
+
+	// systemd shadows one systemd unit from standalone cAdvisor.
+	// +optional
+	Systemd *SystemdSource `json:"systemd,omitempty"`
 }
 
 // DockerSource resolves to PromQL matching all bare-metal Docker containers on
@@ -116,6 +129,42 @@ type DockerSource struct {
 	// "192.0.2.10:4194") to this node's standalone cAdvisor target. It is
 	// required so a multi-target job can never aggregate other nodes into this
 	// node's scheduler reservation.
+	// +kubebuilder:validation:MinLength=1
+	CadvisorInstance string `json:"cadvisorInstance"`
+}
+
+// CgroupSource resolves one cgroup path or bounded cgroup path glob through a
+// standalone cAdvisor scrape target. Glob syntax supports only `*` within path
+// segments; the generated regex is anchored to the full cgroup id.
+type CgroupSource struct {
+	// path is an absolute cgroup-v2 path, for example /system.slice/example.service
+	// or /system.slice/my-worker-*.scope.
+	// +kubebuilder:validation:Pattern=`^/[A-Za-z0-9_.:@\-/*]+$`
+	// +kubebuilder:validation:MinLength=2
+	Path string `json:"path"`
+
+	// cadvisorJob is the Prometheus job label emitted by standalone cAdvisor.
+	// +kubebuilder:default="cadvisor"
+	CadvisorJob string `json:"cadvisorJob,omitempty"`
+
+	// cadvisorInstance pins this source to one host scrape target.
+	// +kubebuilder:validation:MinLength=1
+	CadvisorInstance string `json:"cadvisorInstance"`
+}
+
+// SystemdSource resolves one systemd unit to /system.slice/<unit> on a
+// cgroup-v2/systemd host.
+type SystemdSource struct {
+	// unit is a systemd unit name such as minecraft.service. Path separators
+	// and glob metacharacters are rejected.
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.:@\-]+\.(service|scope|slice)$`
+	Unit string `json:"unit"`
+
+	// cadvisorJob is the Prometheus job label emitted by standalone cAdvisor.
+	// +kubebuilder:default="cadvisor"
+	CadvisorJob string `json:"cadvisorJob,omitempty"`
+
+	// cadvisorInstance pins this source to one host scrape target.
 	// +kubebuilder:validation:MinLength=1
 	CadvisorInstance string `json:"cadvisorInstance"`
 }

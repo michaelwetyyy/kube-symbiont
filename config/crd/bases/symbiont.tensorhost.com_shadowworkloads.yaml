@@ -98,6 +98,31 @@ spec:
                   source declares what to measure on that node. Exactly one source block
                   must be set and it must match type.
                 properties:
+                  cgroup:
+                    description: cgroup shadows a cgroup path (or bounded glob) from
+                      standalone cAdvisor.
+                    properties:
+                      cadvisorInstance:
+                        description: cadvisorInstance pins this source to one host
+                          scrape target.
+                        minLength: 1
+                        type: string
+                      cadvisorJob:
+                        default: cadvisor
+                        description: cadvisorJob is the Prometheus job label emitted
+                          by standalone cAdvisor.
+                        type: string
+                      path:
+                        description: |-
+                          path is an absolute cgroup-v2 path, for example /system.slice/example.service
+                          or /system.slice/my-worker-*.scope.
+                        minLength: 2
+                        pattern: ^/[A-Za-z0-9_.:@\-/*]+$
+                        type: string
+                    required:
+                    - cadvisorInstance
+                    - path
+                    type: object
                   docker:
                     description: |-
                       docker shadows Docker containers running directly on the node
@@ -154,21 +179,49 @@ spec:
                     - cpuCores
                     - memoryBytes
                     type: object
+                  systemd:
+                    description: systemd shadows one systemd unit from standalone
+                      cAdvisor.
+                    properties:
+                      cadvisorInstance:
+                        description: cadvisorInstance pins this source to one host
+                          scrape target.
+                        minLength: 1
+                        type: string
+                      cadvisorJob:
+                        default: cadvisor
+                        description: cadvisorJob is the Prometheus job label emitted
+                          by standalone cAdvisor.
+                        type: string
+                      unit:
+                        description: |-
+                          unit is a systemd unit name such as minecraft.service. Path separators
+                          and glob metacharacters are rejected.
+                        pattern: ^[A-Za-z0-9_.:@\-]+\.(service|scope|slice)$
+                        type: string
+                    required:
+                    - cadvisorInstance
+                    - unit
+                    type: object
                   type:
                     description: type selects the source implementation to resolve.
                     enum:
                     - docker
                     - promql
+                    - cgroup
+                    - systemd
                     type: string
                 required:
                 - type
                 type: object
                 x-kubernetes-validations:
-                - message: exactly one of source.docker or source.promql must be set
-                  rule: '[has(self.docker), has(self.promql)].filter(x, x).size()
-                    == 1'
+                - message: exactly one source block must be set
+                  rule: '[has(self.docker), has(self.promql), has(self.cgroup), has(self.systemd)].filter(x,
+                    x).size() == 1'
                 - message: source.type must match the configured source block
-                  rule: (self.type == 'docker') == has(self.docker)
+                  rule: (self.type == 'docker') == has(self.docker) && (self.type
+                    == 'promql') == has(self.promql) && (self.type == 'cgroup') ==
+                    has(self.cgroup) && (self.type == 'systemd') == has(self.systemd)
               update:
                 description: update controls when observed drift turns into a phantom
                   resize.

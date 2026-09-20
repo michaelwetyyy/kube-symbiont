@@ -63,7 +63,8 @@ Exactly one source per ShadowWorkload; each resolves to a CPU-cores + memory-byt
   cAdvisor job. (Image-label matching was refuted by measurement: cAdvisor monitors the whole
   cgroup tree and k8s pod series carry `image` labels too.)
 - **`promql`** — raw CPU/memory query passthrough; escape hatch for anything else.
-- *(v0.2 planned: `cgroup` path globs and `systemd` unit sources.)*
+- **`cgroup`** — typed cgroup-v2 path or bounded `*` path glob, pinned to one standalone cAdvisor target.
+- **`systemd`** — typed systemd unit source (for example `minecraft.service`), resolved to its `/system.slice/<unit>` cgroup and pinned to one standalone cAdvisor target.
 
 ## Quickstart
 
@@ -127,6 +128,28 @@ spec:
     pollInterval: 30s            # measure → clamp → resize cadence
     floor:   { cpu: 10m, memory: 32Mi }    # workload off / no metrics
     ceiling: { cpu: "8", memory: 32Gi }    # safety clamps
+```
+
+Typed systemd alternative (preferred for host services):
+
+```yaml
+source:
+  type: systemd
+  systemd:
+    unit: minecraft.service
+    cadvisorJob: cadvisor-host
+    cadvisorInstance: "192.0.2.10:4194"
+```
+
+Typed cgroup alternative:
+
+```yaml
+source:
+  type: cgroup
+  cgroup:
+    path: /system.slice/my-worker-*.scope
+    cadvisorJob: cadvisor-host
+    cadvisorInstance: "192.0.2.10:4194"
 ```
 
 Raw-query alternative:
