@@ -352,10 +352,11 @@ func (r *ShadowWorkloadReconciler) measure(
 	// source/backend failure occurs, both remain a coherent last-known-good
 	// snapshot while Conditions describe the current failure.
 	sw.Status.LastMeasurement = &symbiontv1alpha1.MeasurementStatus{
-		Time:        metav1.NewTime(now),
-		CPU:         measured.CPU,
-		Memory:      measured.Memory,
-		SeriesFound: found,
+		ObservedGeneration: sw.Generation,
+		Time:               metav1.NewTime(now),
+		CPU:                measured.CPU,
+		Memory:             measured.Memory,
+		SeriesFound:        found,
 	}
 	sw.Status.ResolvedSource = &symbiontv1alpha1.ResolvedSourceStatus{
 		Type:             description.Type,

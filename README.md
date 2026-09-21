@@ -68,15 +68,18 @@ Exactly one source per ShadowWorkload; each resolves to a CPU-cores + memory-byt
 
 CPU and memory are treated as one accounting snapshot: both series may be absent together (the workload is off), but a partial pair or a negative/non-finite/unrepresentable value is rejected and the phantom keeps its last accepted reservation.
 
+CPU and memory are treated as one accounting snapshot: both series may be absent together (the workload is off), but a partial pair or a negative/non-finite value is rejected and the phantom keeps its last accepted reservation.
+
 ### Operational status
 
 `status.currentCPU` / `status.currentMemory` are the scheduler reservation currently held by the
 phantom. `status.lastMeasurement` records the most recent successful raw CPU/memory observation,
-its timestamp, and whether the source returned an actual series. `status.resolvedSource` records the
-concrete source that produced that same observation (including cgroup path and cAdvisor target for
-typed host sources). Measurement/source snapshots are retained during later backend failures; the
-`Ready` and `Degraded` conditions describe current health, so operators can distinguish stale
-last-known-good truth from a healthy fresh measurement.
+its timestamp, whether the source returned an actual series, and the `observedGeneration` whose
+source/metrics configuration produced it. `status.resolvedSource` records the concrete source that
+produced that same observation (including cgroup path and cAdvisor target for typed host sources).
+Measurement/source snapshots are retained during later backend failures; if a newer spec cannot be
+measured, `lastMeasurement.observedGeneration` intentionally remains behind `metadata.generation`
+while the `Ready` and `Degraded` conditions describe current health at the new generation.
 `kubectl get shadowworkloads` labels the two sides explicitly as `ReserveCPU`/`ReserveMem` and
 `MeasuredCPU`/`MeasuredMem`; `-o wide` also shows the phantom pod and last measurement time.
 
@@ -91,7 +94,7 @@ this legacy-schema → CRD upgrade → CR migration path.
 
 ## Quickstart
 
-Prerequisites: Go 1.26+ (go.mod declares go 1.26.0), kubectl, kustomize (Makefile fetches tools locally), and a cluster
+Prerequisites: Go 1.26.7+ (go.mod declares go 1.26.7), kubectl, kustomize (Makefile fetches tools locally), and a cluster
 running Kubernetes ≥ 1.29 with Prometheus already scraping cAdvisor.
 
 ```sh

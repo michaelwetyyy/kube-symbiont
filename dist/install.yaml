@@ -4,6 +4,12 @@ metadata:
   labels:
     app.kubernetes.io/managed-by: kustomize
     app.kubernetes.io/name: kube-symbiont
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
   name: kube-symbiont-system
 ---
 apiVersion: scheduling.k8s.io/v1
@@ -456,6 +462,13 @@ spec:
                       floor/ceiling clamping.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
+                  observedGeneration:
+                    description: |-
+                      observedGeneration is the ShadowWorkload generation whose source and
+                      metrics configuration produced this measurement. It may intentionally
+                      lag metadata.generation while a newly edited spec is degraded.
+                    format: int64
+                    type: integer
                   seriesFound:
                     description: |-
                       seriesFound distinguishes a real zero-valued sample from an empty query
@@ -468,6 +481,7 @@ spec:
                 required:
                 - cpu
                 - memory
+                - observedGeneration
                 - seriesFound
                 - time
                 type: object
@@ -823,7 +837,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: ghcr.io/michaelwetyyy/kube-symbiont:0.1.0
+        image: example.com/kube-symbiont:v0.0.1
         livenessProbe:
           httpGet:
             path: /healthz

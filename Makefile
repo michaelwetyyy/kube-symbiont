@@ -88,8 +88,8 @@ setup-test-e2e: ## Set up an isolated Kind cluster and dedicated kubeconfig for 
 	@mkdir -p "$(dir $(E2E_KUBECONFIG))"
 	@case "$$($(KIND) get clusters)" in \
 		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Exporting its isolated kubeconfig."; \
-			$(KIND) export kubeconfig --name $(KIND_CLUSTER) --kubeconfig "$(E2E_KUBECONFIG)" ;; \
+			echo "Refusing to reuse existing Kind cluster '$(KIND_CLUSTER)'; choose another KIND_CLUSTER or remove it explicitly."; \
+			exit 1 ;; \
 		*) \
 			echo "Creating Kind cluster '$(KIND_CLUSTER)' with isolated kubeconfig..."; \
 			rm -f "$(E2E_KUBECONFIG)"; \
@@ -105,14 +105,15 @@ setup-test-e2e: ## Set up an isolated Kind cluster and dedicated kubeconfig for 
 test-e2e: manifests generate fmt vet ## Run e2e tests only against the isolated Kind kubeconfig.
 	@set +e; \
 	$(MAKE) setup-test-e2e; \
-	rc=$$?; \
-	if [ $$rc -eq 0 ]; then \
+	setup_rc=$$?; \
+	rc=$$setup_rc; \
+	if [ $$setup_rc -eq 0 ]; then \
 		KUBECONFIG="$(E2E_KUBECONFIG)" KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v; \
 		rc=$$?; \
+		$(MAKE) cleanup-test-e2e; \
+		cleanup_rc=$$?; \
+		if [ $$rc -eq 0 ]; then rc=$$cleanup_rc; fi; \
 	fi; \
-	$(MAKE) cleanup-test-e2e; \
-	cleanup_rc=$$?; \
-	if [ $$rc -eq 0 ]; then rc=$$cleanup_rc; fi; \
 	exit $$rc
 
 .PHONY: cleanup-test-e2e

@@ -358,6 +358,8 @@ func validCPUResourceSample(value float64) bool {
 }
 
 func validMemoryResourceSample(value float64) bool {
+	// float64(MaxInt64) rounds up to 2^63. Step down one representable float
+	// so NewQuantity's int64 input can never saturate.
 	maxInt64Float := math.Nextafter(float64(math.MaxInt64), 0)
 	return validFiniteNonNegative(value) && value <= maxInt64Float
 }

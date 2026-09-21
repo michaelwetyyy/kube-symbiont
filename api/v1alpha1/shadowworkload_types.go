@@ -254,6 +254,11 @@ type UpdatePolicy struct {
 // It is intentionally preserved across backend outages so status remains a
 // durable last-known-good observation instead of collapsing to zero.
 type MeasurementStatus struct {
+	// observedGeneration is the ShadowWorkload generation whose source and
+	// metrics configuration produced this measurement. It may intentionally
+	// lag metadata.generation while a newly edited spec is degraded.
+	ObservedGeneration int64 `json:"observedGeneration"`
+
 	// time is when the measurement completed successfully.
 	Time metav1.Time `json:"time"`
 

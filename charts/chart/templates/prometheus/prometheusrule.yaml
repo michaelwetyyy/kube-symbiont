@@ -47,7 +47,7 @@ spec:
         severity: warning
       annotations:
         summary: ShadowWorkload {{"{{ $labels.namespace }}"}}/{{"{{ $labels.name }}"}} reported {{"{{ $labels.reason }}"}}
-        description: A measurement or reservation-update failure occurred in the last ten minutes; inspect the bounded reason label.
+        description: A measurement or reservation-update failure occurred in the last ten minutes; the bounded reason distinguishes backend, multi/partial/invalid sample, resize and source failures.
     - alert: KubeSymbiontReservationFlapping
       expr: increase(kube_symbiont_shadowworkload_reservation_updates_total[15m]) > 6
       for: 5m

@@ -36,8 +36,9 @@ import (
 // namespace where the project is deployed in
 const namespace = "kube-symbiont-system"
 
-// serviceAccountName created for the project
-const serviceAccountName = "kube-symbiont-controller-manager"
+// metricsProbeServiceAccountName is a least-privilege identity used only by
+// the E2E metrics probe. It must not borrow the controller manager's RBAC.
+const metricsProbeServiceAccountName = "kube-symbiont-metrics-probe"
 
 // metricsServiceName is the name of the metrics service of the project
 const metricsServiceName = "kube-symbiont-controller-manager-metrics-service"
@@ -93,8 +94,12 @@ var _ = Describe("Manager", Ordered, func() {
 
 	// After all tests have been executed, delete the exact installed manifest.
 	AfterAll(func() {
-		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
+		By("cleaning up the curl pod and least-privilege metrics identity")
+		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+		cmd = exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+		cmd = exec.Command("kubectl", "delete", "serviceaccount", metricsProbeServiceAccountName, "-n", namespace, "--ignore-not-found")
 		_, _ = utils.Run(cmd)
 
 		By("cleaning up the reconciliation test resource")
@@ -247,11 +252,12 @@ var _ = Describe("Manager", Ordered, func() {
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to apply the installer")
 
-			By("labeling the deployed namespace to enforce the restricted security policy")
-			cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
-				"pod-security.kubernetes.io/enforce=restricted")
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
+			By("verifying the installer enforced Restricted Pod Security before workload admission")
+			cmd = exec.Command("kubectl", "get", "namespace", namespace,
+				"-o", "jsonpath={.metadata.labels.pod-security\\.kubernetes\\.io/enforce}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to read namespace Pod Security labels")
+			Expect(output).To(Equal("restricted"))
 		})
 
 		It("should run successfully", func() {
@@ -351,13 +357,18 @@ spec:
 		})
 
 		It("should ensure the metrics endpoint is serving metrics", func() {
-			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=kube-symbiont-metrics-reader",
-				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
-			)
+			By("creating a dedicated least-privilege service account for the metrics probe")
+			cmd := exec.Command("kubectl", "create", "serviceaccount", metricsProbeServiceAccountName, "-n", namespace)
 			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
+			Expect(err).NotTo(HaveOccurred(), "Failed to create metrics probe ServiceAccount")
+
+			By("granting only the non-resource /metrics reader role to the probe")
+			cmd = exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
+				"--clusterrole=kube-symbiont-metrics-reader",
+				fmt.Sprintf("--serviceaccount=%s:%s", namespace, metricsProbeServiceAccountName),
+			)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create metrics probe ClusterRoleBinding")
 
 			By("validating that the metrics service is available")
 			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
@@ -389,13 +400,13 @@ spec:
 			By("creating the curl-metrics pod to access the metrics endpoint")
 			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
 				"--namespace", namespace,
-				"--image=curlimages/curl:latest",
+				"--image=curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6",
 				"--overrides",
 				fmt.Sprintf(`{
 					"spec": {
 						"containers": [{
 							"name": "curl",
-							"image": "curlimages/curl:latest",
+							"image": "curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6",
 							"command": ["/bin/sh", "-c"],
 							"args": [
 								"TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token); for i in $(seq 1 30); do curl -v -k -H \"Authorization: Bearer $TOKEN\" https://%s.%s.svc.cluster.local:8443/metrics && exit 0 || sleep 2; done; exit 1"
@@ -415,7 +426,7 @@ spec:
 						}],
 						"serviceAccountName": "%s"
 					}
-				}`, metricsServiceName, namespace, serviceAccountName))
+				}`, metricsServiceName, namespace, metricsProbeServiceAccountName))
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
 

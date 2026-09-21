@@ -352,6 +352,7 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(updated.Status.CurrentCPU.String()).To(Equal("2"))
 		Expect(updated.Status.CurrentMemory.String()).To(Equal("6Gi"))
 		Expect(updated.Status.LastMeasurement).NotTo(BeNil())
+		Expect(updated.Status.LastMeasurement.ObservedGeneration).To(Equal(updated.Generation))
 		Expect(updated.Status.LastMeasurement.CPU.String()).To(Equal("2"))
 		Expect(updated.Status.LastMeasurement.Memory.String()).To(Equal("6Gi"))
 		Expect(updated.Status.LastMeasurement.SeriesFound).To(BeTrue())
@@ -526,25 +527,50 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(recovered.Status.LastMeasurement.Time.After(lastMeasurementTime.Time)).To(BeTrue())
 	})
 
-	It("should retain last truth for an incomplete resource measurement", func() {
+	It("should preserve last truth when a resource pair is only partially measurable", func() {
 		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 		Expect(err).NotTo(HaveOccurred())
 
 		before := &symbiontv1alpha1.ShadowWorkload{}
 		Expect(k8sClient.Get(ctx, key, before)).To(Succeed())
+		Expect(before.Status.LastMeasurement).NotTo(BeNil())
+		measurementGeneration := before.Status.LastMeasurement.ObservedGeneration
+		measurementTime := before.Status.LastMeasurement.Time
+		measurementCPU := before.Status.LastMeasurement.CPU.DeepCopy()
+		measurementMemory := before.Status.LastMeasurement.Memory.DeepCopy()
+		reservedCPU := before.Status.CurrentCPU.DeepCopy()
+		reservedMemory := before.Status.CurrentMemory.DeepCopy()
 		lastResize := before.Status.LastResize
+
+		By("editing the spec before the incomplete measurement")
+		before.Spec.Metrics.Window = "2m"
+		Expect(k8sClient.Update(ctx, before)).To(Succeed())
+		changed := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, changed)).To(Succeed())
+		Expect(changed.Generation).To(BeNumerically(">", measurementGeneration))
+
 		stub.err = sources.ErrPartialSample
 		stub.cpu, stub.mem = 8, 0
-
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 		Expect(err).NotTo(HaveOccurred())
+
 		after := &symbiontv1alpha1.ShadowWorkload{}
 		Expect(k8sClient.Get(ctx, key, after)).To(Succeed())
-		Expect(after.Status.CurrentCPU.String()).To(Equal("2"))
-		Expect(after.Status.CurrentMemory.String()).To(Equal("6Gi"))
+		Expect(after.Status.CurrentCPU.Cmp(reservedCPU)).To(Equal(0))
+		Expect(after.Status.CurrentMemory.Cmp(reservedMemory)).To(Equal(0))
 		Expect(after.Status.LastResize.Equal(&lastResize)).To(BeTrue())
-		Expect(meta.FindStatusCondition(after.Status.Conditions, "Degraded").Reason).To(Equal("PrometheusUnavailable"))
+		Expect(after.Status.LastMeasurement).NotTo(BeNil())
+		Expect(after.Status.LastMeasurement.ObservedGeneration).To(Equal(measurementGeneration))
+		Expect(after.Status.LastMeasurement.ObservedGeneration).To(BeNumerically("<", after.Generation))
+		Expect(after.Status.LastMeasurement.Time.Equal(&measurementTime)).To(BeTrue())
+		Expect(after.Status.LastMeasurement.CPU.Cmp(measurementCPU)).To(Equal(0))
+		Expect(after.Status.LastMeasurement.Memory.Cmp(measurementMemory)).To(Equal(0))
+		degraded := meta.FindStatusCondition(after.Status.Conditions, conditionDegraded)
+		Expect(degraded).NotTo(BeNil())
+		Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+		Expect(degraded.Reason).To(Equal(reasonPrometheusUnavailable))
+		Expect(degraded.ObservedGeneration).To(Equal(after.Generation))
 	})
 
 	It("should return status patch failures so controller-runtime retries", func() {

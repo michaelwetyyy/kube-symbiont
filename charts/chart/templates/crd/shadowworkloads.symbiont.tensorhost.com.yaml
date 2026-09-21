@@ -439,6 +439,13 @@ spec:
                       floor/ceiling clamping.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
+                  observedGeneration:
+                    description: |-
+                      observedGeneration is the ShadowWorkload generation whose source and
+                      metrics configuration produced this measurement. It may intentionally
+                      lag metadata.generation while a newly edited spec is degraded.
+                    format: int64
+                    type: integer
                   seriesFound:
                     description: |-
                       seriesFound distinguishes a real zero-valued sample from an empty query
@@ -451,6 +458,7 @@ spec:
                 required:
                 - cpu
                 - memory
+                - observedGeneration
                 - seriesFound
                 - time
                 type: object

@@ -81,6 +81,17 @@ jobs:
 #          helm repo update
 #          helm install prometheus-crds prometheus-community/prometheus-operator-crds
 
+      - name: Enforce Restricted Pod Security on Helm namespace
+        run: |
+          kubectl create namespace kube-symbiont-system
+          kubectl label namespace kube-symbiont-system \
+            pod-security.kubernetes.io/enforce=restricted \
+            pod-security.kubernetes.io/enforce-version=latest \
+            pod-security.kubernetes.io/audit=restricted \
+            pod-security.kubernetes.io/audit-version=latest \
+            pod-security.kubernetes.io/warn=restricted \
+            pod-security.kubernetes.io/warn-version=latest
+
       - name: Deploy manager via Helm
         run: |
           make helm-deploy
