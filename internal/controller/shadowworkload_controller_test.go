@@ -50,9 +50,10 @@ import (
 // stubQuerier returns a canned CPU-cores/memory-bytes measurement so the
 // reconcile loop runs end-to-end against envtest without a Prometheus.
 type stubQuerier struct {
-	cpu float64
-	mem float64
-	err error
+	cpu   float64
+	mem   float64
+	found *bool
+	err   error
 }
 
 type recordingNodeReader struct {
@@ -89,7 +90,11 @@ func (r *recordingNodeReader) Get(ctx context.Context, key client.ObjectKey, obj
 }
 
 func (s *stubQuerier) QueryPair(_ context.Context, _ sources.Queries) (float64, float64, bool, error) {
-	return s.cpu, s.mem, true, s.err
+	found := true
+	if s.found != nil {
+		found = *s.found
+	}
+	return s.cpu, s.mem, found, s.err
 }
 
 // drainEvents empties the fake recorder's event channel without blocking and
@@ -346,6 +351,15 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(updated.Status.PhantomPod).To(Equal(phantomKey.Name))
 		Expect(updated.Status.CurrentCPU.String()).To(Equal("2"))
 		Expect(updated.Status.CurrentMemory.String()).To(Equal("6Gi"))
+		Expect(updated.Status.LastMeasurement).NotTo(BeNil())
+		Expect(updated.Status.LastMeasurement.CPU.String()).To(Equal("2"))
+		Expect(updated.Status.LastMeasurement.Memory.String()).To(Equal("6Gi"))
+		Expect(updated.Status.LastMeasurement.SeriesFound).To(BeTrue())
+		Expect(updated.Status.LastMeasurement.Time.IsZero()).To(BeFalse())
+		Expect(updated.Status.ResolvedSource).NotTo(BeNil())
+		Expect(updated.Status.ResolvedSource.Type).To(Equal(symbiontv1alpha1.SourceTypeDocker))
+		Expect(updated.Status.ResolvedSource.CadvisorJob).To(Equal("cadvisor"))
+		Expect(updated.Status.ResolvedSource.CadvisorInstance).To(Equal(testCadvisorTarget))
 
 		By("doubling the measurement: drift exceeds threshold, in-place resize expected")
 		stub.cpu = 4
@@ -407,6 +421,8 @@ var _ = Describe("ShadowWorkload Controller", func() {
 
 	It("should floor the phantom when the workload emits nothing", func() {
 		stub.cpu, stub.mem = 0, 0
+		found := false
+		stub.found = &found
 		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
 
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
@@ -416,6 +432,10 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(k8sClient.Get(ctx, key, updated)).To(Succeed())
 		Expect(updated.Status.CurrentCPU.String()).To(Equal("10m"))
 		Expect(updated.Status.CurrentMemory.String()).To(Equal("32Mi"))
+		Expect(updated.Status.LastMeasurement).NotTo(BeNil())
+		Expect(updated.Status.LastMeasurement.CPU.IsZero()).To(BeTrue())
+		Expect(updated.Status.LastMeasurement.Memory.IsZero()).To(BeTrue())
+		Expect(updated.Status.LastMeasurement.SeriesFound).To(BeFalse())
 	})
 
 	It("should preserve accepted requests and status when a resize is rejected", func() {
@@ -456,6 +476,12 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		before := &symbiontv1alpha1.ShadowWorkload{}
 		Expect(k8sClient.Get(ctx, key, before)).To(Succeed())
 		lastResize := before.Status.LastResize
+		Expect(before.Status.LastMeasurement).NotTo(BeNil())
+		lastMeasurementTime := before.Status.LastMeasurement.Time
+		lastMeasurementCPU := before.Status.LastMeasurement.CPU.DeepCopy()
+		lastMeasurementMemory := before.Status.LastMeasurement.Memory.DeepCopy()
+		Expect(before.Status.ResolvedSource).NotTo(BeNil())
+		lastResolvedSource := *before.Status.ResolvedSource
 		stub.err = errors.New("test metrics outage")
 		stub.cpu, stub.mem = 4, 12*1024*1024*1024
 
@@ -467,14 +493,27 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(outage.Status.CurrentMemory.String()).To(Equal("6Gi"))
 		Expect(outage.Status.LastResize.Equal(&lastResize)).To(BeTrue())
 		Expect(meta.FindStatusCondition(outage.Status.Conditions, "Degraded").Reason).To(Equal("PrometheusUnavailable"))
+		Expect(outage.Status.LastMeasurement).NotTo(BeNil())
+		Expect(outage.Status.LastMeasurement.Time.Equal(&lastMeasurementTime)).To(BeTrue())
+		Expect(outage.Status.LastMeasurement.CPU.Cmp(lastMeasurementCPU)).To(Equal(0))
+		Expect(outage.Status.LastMeasurement.Memory.Cmp(lastMeasurementMemory)).To(Equal(0))
+		Expect(outage.Status.ResolvedSource).NotTo(BeNil())
+		Expect(*outage.Status.ResolvedSource).To(Equal(lastResolvedSource))
 
 		stub.err = nil
+		// metav1.Time serializes at whole-second precision; cross a second
+		// boundary so the persisted timestamp is deterministically newer.
+		time.Sleep(1100 * time.Millisecond)
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 		Expect(err).NotTo(HaveOccurred())
 		recovered := &symbiontv1alpha1.ShadowWorkload{}
 		Expect(k8sClient.Get(ctx, key, recovered)).To(Succeed())
 		Expect(recovered.Status.CurrentCPU.String()).To(Equal("4"))
 		Expect(meta.IsStatusConditionFalse(recovered.Status.Conditions, "Degraded")).To(BeTrue())
+		Expect(recovered.Status.LastMeasurement).NotTo(BeNil())
+		Expect(recovered.Status.LastMeasurement.CPU.String()).To(Equal("4"))
+		Expect(recovered.Status.LastMeasurement.Memory.String()).To(Equal("12Gi"))
+		Expect(recovered.Status.LastMeasurement.Time.After(lastMeasurementTime.Time)).To(BeTrue())
 	})
 
 	It("should retain last truth for an incomplete resource measurement", func() {

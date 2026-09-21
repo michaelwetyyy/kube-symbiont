@@ -20,9 +20,12 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
 )
@@ -30,10 +33,14 @@ import (
 const (
 	certmanagerVersion = "v1.20.2"
 	certmanagerURLTmpl = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
+	certmanagerMaxSize = 16 << 20
+	certmanagerRetries = 5
 
 	defaultKindBinary  = "kind"
 	defaultKindCluster = "kind"
 )
+
+var certmanagerManifestPath string
 
 func warnError(err error) {
 	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)
@@ -59,12 +66,19 @@ func Run(cmd *exec.Cmd) (string, error) {
 	return string(output), nil
 }
 
-// UninstallCertManager uninstalls the cert manager
+// UninstallCertManager uninstalls the cert manager using the exact manifest
+// downloaded for this test run. Cleanup therefore does not depend on GitHub
+// still being reachable after the suite finishes.
 func UninstallCertManager() {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "delete", "-f", url)
-	if _, err := Run(cmd); err != nil {
-		warnError(err)
+	if certmanagerManifestPath != "" {
+		cmd := exec.Command("kubectl", "delete", "-f", certmanagerManifestPath)
+		if _, err := Run(cmd); err != nil {
+			warnError(err)
+		}
+		if err := os.Remove(certmanagerManifestPath); err != nil && !os.IsNotExist(err) {
+			warnError(fmt.Errorf("remove cached cert-manager manifest: %w", err))
+		}
+		certmanagerManifestPath = ""
 	}
 
 	// Delete leftover leases in kube-system (not cleaned by default)
@@ -73,7 +87,7 @@ func UninstallCertManager() {
 		"cert-manager-controller",
 	}
 	for _, lease := range kubeSystemLeases {
-		cmd = exec.Command("kubectl", "delete", "lease", lease,
+		cmd := exec.Command("kubectl", "delete", "lease", lease,
 			"-n", "kube-system", "--ignore-not-found", "--force", "--grace-period=0")
 		if _, err := Run(cmd); err != nil {
 			warnError(err)
@@ -81,10 +95,16 @@ func UninstallCertManager() {
 	}
 }
 
-// InstallCertManager installs the cert manager bundle.
+// InstallCertManager installs the pinned cert-manager bundle. The manifest is
+// downloaded before kubectl sees it, with bounded retries for transient release
+// hosting/proxy failures.
 func InstallCertManager() error {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "apply", "-f", url)
+	manifestPath, err := downloadCertManagerManifest()
+	if err != nil {
+		return err
+	}
+	certmanagerManifestPath = manifestPath
+	cmd := exec.Command("kubectl", "apply", "-f", manifestPath)
 	if _, err := Run(cmd); err != nil {
 		return err
 	}
@@ -96,8 +116,63 @@ func InstallCertManager() error {
 		"--timeout", "5m",
 	)
 
-	_, err := Run(cmd)
+	_, err = Run(cmd)
 	return err
+}
+
+func downloadCertManagerManifest() (string, error) {
+	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
+	client := &http.Client{Timeout: 30 * time.Second}
+	var lastErr error
+
+	for attempt := 1; attempt <= certmanagerRetries; attempt++ {
+		response, err := client.Get(url) // #nosec G107 -- pinned release URL controlled by this test binary.
+		if err == nil {
+			body, readErr := io.ReadAll(io.LimitReader(response.Body, certmanagerMaxSize+1))
+			closeErr := response.Body.Close()
+			switch {
+			case response.StatusCode != http.StatusOK:
+				lastErr = fmt.Errorf("download cert-manager manifest: HTTP %s", response.Status)
+			case readErr != nil:
+				lastErr = fmt.Errorf("read cert-manager manifest: %w", readErr)
+			case closeErr != nil:
+				lastErr = fmt.Errorf("close cert-manager response: %w", closeErr)
+			case len(body) > certmanagerMaxSize:
+				lastErr = fmt.Errorf("cert-manager manifest exceeds %d bytes", certmanagerMaxSize)
+			case len(body) < 1024:
+				lastErr = fmt.Errorf("cert-manager manifest is unexpectedly small: %d bytes", len(body))
+			default:
+				file, err := os.CreateTemp("", fmt.Sprintf("kube-symbiont-cert-manager-%s-*.yaml", certmanagerVersion))
+				if err != nil {
+					return "", fmt.Errorf("create cert-manager manifest cache: %w", err)
+				}
+				path := file.Name()
+				if err := file.Chmod(0o600); err != nil {
+					_ = file.Close()
+					_ = os.Remove(path)
+					return "", fmt.Errorf("secure cert-manager manifest cache: %w", err)
+				}
+				if _, err := file.Write(body); err != nil {
+					_ = file.Close()
+					_ = os.Remove(path)
+					return "", fmt.Errorf("cache cert-manager manifest: %w", err)
+				}
+				if err := file.Close(); err != nil {
+					_ = os.Remove(path)
+					return "", fmt.Errorf("close cert-manager manifest cache: %w", err)
+				}
+				return path, nil
+			}
+		} else {
+			lastErr = fmt.Errorf("download cert-manager manifest: %w", err)
+		}
+
+		if attempt < certmanagerRetries {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+	}
+
+	return "", fmt.Errorf("cert-manager manifest unavailable after %d attempts: %w", certmanagerRetries, lastErr)
 }
 
 // IsCertManagerCRDsInstalled checks if any Cert Manager CRDs are installed

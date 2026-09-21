@@ -250,6 +250,42 @@ type UpdatePolicy struct {
 	Ceiling ResourcePair `json:"ceiling"`
 }
 
+// MeasurementStatus records the last successful raw source measurement.
+// It is intentionally preserved across backend outages so status remains a
+// durable last-known-good observation instead of collapsing to zero.
+type MeasurementStatus struct {
+	// time is when the measurement completed successfully.
+	Time metav1.Time `json:"time"`
+
+	// cpu is the raw measured CPU footprint before floor/ceiling clamping.
+	CPU resource.Quantity `json:"cpu"`
+
+	// memory is the raw measured memory footprint before floor/ceiling clamping.
+	Memory resource.Quantity `json:"memory"`
+
+	// seriesFound distinguishes a real zero-valued sample from an empty query
+	// result (for example, a stopped service with no current cAdvisor series).
+	SeriesFound bool `json:"seriesFound"`
+}
+
+// ResolvedSourceStatus exposes the concrete source that produced the durable
+// lastMeasurement snapshot without leaking generated PromQL into status.
+type ResolvedSourceStatus struct {
+	Type SourceType `json:"type"`
+
+	// cgroupPath is populated for typed cgroup/systemd sources.
+	// +optional
+	CgroupPath string `json:"cgroupPath,omitempty"`
+
+	// cadvisorJob is populated for host sources backed by standalone cAdvisor.
+	// +optional
+	CadvisorJob string `json:"cadvisorJob,omitempty"`
+
+	// cadvisorInstance is the exact host scrape target used for accounting.
+	// +optional
+	CadvisorInstance string `json:"cadvisorInstance,omitempty"`
+}
+
 // ShadowWorkloadStatus defines the observed state of ShadowWorkload.
 type ShadowWorkloadStatus struct {
 	// phantomPod is the name of the ballast pod maintained on spec.node, if
@@ -268,6 +304,17 @@ type ShadowWorkloadStatus struct {
 	// lastResize is the time of the most recent accepted in-place resize.
 	// +optional
 	LastResize metav1.Time `json:"lastResize,omitempty"`
+
+	// lastMeasurement is the most recent successful raw source measurement.
+	// It is retained during subsequent source/backend failures.
+	// +optional
+	LastMeasurement *MeasurementStatus `json:"lastMeasurement,omitempty"`
+
+	// resolvedSource describes the concrete source that produced
+	// lastMeasurement. It advances atomically with lastMeasurement and is
+	// retained with that last-known-good snapshot during later failures.
+	// +optional
+	ResolvedSource *ResolvedSourceStatus `json:"resolvedSource,omitempty"`
 
 	// conditions represent observations of the phantom lifecycle. Known types:
 	// Ready (phantom exists and tracks measurements), Degraded (node missing,

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -51,9 +52,17 @@ func TestE2E(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
+	By("verifying kubectl is isolated to the requested Kind cluster")
+	expectedContext := "kind-" + os.Getenv("KIND_CLUSTER")
+	cmd := exec.Command("kubectl", "config", "current-context")
+	contextOutput, err := utils.Run(cmd)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to read the e2e kubectl context")
+	ExpectWithOffset(1, strings.TrimSpace(contextOutput)).To(Equal(expectedContext),
+		"Refusing to run e2e tests outside the isolated Kind context")
+
 	By("building the manager image")
-	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", managerImage))
-	_, err := utils.Run(cmd)
+	cmd = exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", managerImage))
+	_, err = utils.Run(cmd)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager image")
 
 	// TODO(user): If you want to change the e2e test vendor from Kind,

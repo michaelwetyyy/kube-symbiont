@@ -29,8 +29,13 @@ import (
 )
 
 const (
-	testCPUQuery    = "cpu"
-	testMemoryQuery = "mem"
+	testCPUQuery            = "cpu"
+	testMemoryQuery         = "mem"
+	testCadvisorHostJob     = "cadvisor-host"
+	testCadvisorInstance    = "192.0.2.10:4194"
+	testLabCadvisorInstance = "192.168.1.124:4194"
+	testCgroupGlob          = "/system.slice/worker-*.scope"
+	testSystemdUnit         = "minecraft.service"
 )
 
 func dockerSpec(job, instance string) *symbiontv1alpha1.ShadowWorkloadSpec {
@@ -45,7 +50,7 @@ func dockerSpec(job, instance string) *symbiontv1alpha1.ShadowWorkloadSpec {
 }
 
 func TestResolveDockerGeneratesIDPrefixSelectors(t *testing.T) {
-	q, err := Resolve(dockerSpec("cadvisor", "192.0.2.10:4194"))
+	q, err := Resolve(dockerSpec("cadvisor", testCadvisorInstance))
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -63,7 +68,7 @@ func TestResolveDockerGeneratesIDPrefixSelectors(t *testing.T) {
 }
 
 func TestResolveDockerDefaultsJobAndRequiresInstance(t *testing.T) {
-	q, err := Resolve(dockerSpec("", "192.0.2.10:4194"))
+	q, err := Resolve(dockerSpec("", testCadvisorInstance))
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -79,7 +84,7 @@ func TestResolveDockerDefaultsJobAndRequiresInstance(t *testing.T) {
 }
 
 func TestResolveDockerEscapesLabelValues(t *testing.T) {
-	q, err := Resolve(dockerSpec(`my"job\`, "192.0.2.10:4194"))
+	q, err := Resolve(dockerSpec(`my"job\`, testCadvisorInstance))
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -395,7 +400,7 @@ func TestResolveSystemdGeneratesExactCgroupSelector(t *testing.T) {
 	spec := &symbiontv1alpha1.ShadowWorkloadSpec{
 		Source: symbiontv1alpha1.SourceSpec{
 			Type:    symbiontv1alpha1.SourceTypeSystemd,
-			Systemd: &symbiontv1alpha1.SystemdSource{Unit: "minecraft.service", CadvisorJob: "cadvisor-host", CadvisorInstance: "192.168.1.124:4194"},
+			Systemd: &symbiontv1alpha1.SystemdSource{Unit: testSystemdUnit, CadvisorJob: testCadvisorHostJob, CadvisorInstance: testLabCadvisorInstance},
 		},
 		Metrics: symbiontv1alpha1.MetricsConfig{Window: "5m"},
 	}
@@ -403,7 +408,7 @@ func TestResolveSystemdGeneratesExactCgroupSelector(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	want := `job="cadvisor-host",instance="192.168.1.124:4194",id="/system.slice/minecraft.service"`
+	want := `job="` + testCadvisorHostJob + `",instance="` + testLabCadvisorInstance + `",id="/system.slice/minecraft.service"`
 	if !strings.Contains(q.CPUCores, want) || !strings.Contains(q.MemoryBytes, want) {
 		t.Fatalf("systemd matcher missing: %+v", q)
 	}
@@ -413,7 +418,7 @@ func TestResolveCgroupGlobIsAnchoredAndEscaped(t *testing.T) {
 	spec := &symbiontv1alpha1.ShadowWorkloadSpec{
 		Source: symbiontv1alpha1.SourceSpec{
 			Type:   symbiontv1alpha1.SourceTypeCgroup,
-			Cgroup: &symbiontv1alpha1.CgroupSource{Path: "/system.slice/worker-*.scope", CadvisorInstance: "192.0.2.10:4194"},
+			Cgroup: &symbiontv1alpha1.CgroupSource{Path: testCgroupGlob, CadvisorInstance: testCadvisorInstance},
 		},
 		Metrics: symbiontv1alpha1.MetricsConfig{Window: "2m"},
 	}
@@ -434,7 +439,7 @@ func TestResolveTypedHostSourcesRejectUnsafeInputs(t *testing.T) {
 		{Type: symbiontv1alpha1.SourceTypeSystemd, Systemd: &symbiontv1alpha1.SystemdSource{Unit: "../minecraft.service", CadvisorInstance: "x"}},
 		{Type: symbiontv1alpha1.SourceTypeSystemd, Systemd: &symbiontv1alpha1.SystemdSource{Unit: "worker@blue.service", CadvisorInstance: "x"}},
 		{Type: symbiontv1alpha1.SourceTypeSystemd, Systemd: &symbiontv1alpha1.SystemdSource{Unit: "batch.slice", CadvisorInstance: "x"}},
-		{Type: symbiontv1alpha1.SourceTypeSystemd, Systemd: &symbiontv1alpha1.SystemdSource{Unit: "minecraft.service", CadvisorInstance: ""}},
+		{Type: symbiontv1alpha1.SourceTypeSystemd, Systemd: &symbiontv1alpha1.SystemdSource{Unit: testSystemdUnit, CadvisorInstance: ""}},
 		{Type: symbiontv1alpha1.SourceTypeCgroup, Cgroup: &symbiontv1alpha1.CgroupSource{Path: "/system.slice//bad.service", CadvisorInstance: "x"}},
 		{Type: symbiontv1alpha1.SourceTypeCgroup, Cgroup: &symbiontv1alpha1.CgroupSource{Path: "/system.slice/x.service", CadvisorInstance: ""}},
 	}
@@ -443,5 +448,29 @@ func TestResolveTypedHostSourcesRejectUnsafeInputs(t *testing.T) {
 		if _, err := Resolve(spec); err == nil {
 			t.Errorf("case %d: expected error", i)
 		}
+	}
+}
+
+func TestDescribeTypedHostSources(t *testing.T) {
+	systemd := &symbiontv1alpha1.ShadowWorkloadSpec{
+		Source: symbiontv1alpha1.SourceSpec{
+			Type:    symbiontv1alpha1.SourceTypeSystemd,
+			Systemd: &symbiontv1alpha1.SystemdSource{Unit: testSystemdUnit, CadvisorJob: testCadvisorHostJob, CadvisorInstance: testCadvisorInstance},
+		},
+	}
+	d := Describe(systemd)
+	if d.Type != symbiontv1alpha1.SourceTypeSystemd || d.CgroupPath != "/system.slice/minecraft.service" || d.CadvisorJob != testCadvisorHostJob || d.CadvisorInstance != testCadvisorInstance {
+		t.Fatalf("unexpected systemd description: %+v", d)
+	}
+
+	cgroup := &symbiontv1alpha1.ShadowWorkloadSpec{
+		Source: symbiontv1alpha1.SourceSpec{
+			Type:   symbiontv1alpha1.SourceTypeCgroup,
+			Cgroup: &symbiontv1alpha1.CgroupSource{Path: testCgroupGlob, CadvisorInstance: "192.0.2.11:4194"},
+		},
+	}
+	d = Describe(cgroup)
+	if d.CgroupPath != testCgroupGlob || d.CadvisorJob != "cadvisor" || d.CadvisorInstance != "192.0.2.11:4194" {
+		t.Fatalf("unexpected cgroup description: %+v", d)
 	}
 }

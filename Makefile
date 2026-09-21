@@ -79,29 +79,48 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # CertManager is installed by default; skip with:
 # - CERT_MANAGER_INSTALL_SKIP=true
 KIND_CLUSTER ?= kube-symbiont-test-e2e
+E2E_KUBECONFIG ?= $(abspath $(LOCALBIN)/$(KIND_CLUSTER).kubeconfig)
 
 .PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
+setup-test-e2e: ## Set up an isolated Kind cluster and dedicated kubeconfig for e2e tests
 	@command -v $(KIND) >/dev/null 2>&1 || { \
 		echo "Kind is not installed. Please install Kind manually."; \
 		exit 1; \
 	}
+	@mkdir -p "$(dir $(E2E_KUBECONFIG))"
 	@case "$$($(KIND) get clusters)" in \
 		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
+			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Exporting its isolated kubeconfig."; \
+			$(KIND) export kubeconfig --name $(KIND_CLUSTER) --kubeconfig "$(E2E_KUBECONFIG)" ;; \
 		*) \
-			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
+			echo "Creating Kind cluster '$(KIND_CLUSTER)' with isolated kubeconfig..."; \
+			rm -f "$(E2E_KUBECONFIG)"; \
+			$(KIND) create cluster --name $(KIND_CLUSTER) --kubeconfig "$(E2E_KUBECONFIG)" ;; \
 	esac
+	@context="$$(KUBECONFIG="$(E2E_KUBECONFIG)" $(KUBECTL) config current-context)"; \
+	test "$$context" = "kind-$(KIND_CLUSTER)" || { \
+		echo "Refusing e2e run: isolated kubeconfig points at '$$context', expected 'kind-$(KIND_CLUSTER)'"; \
+		exit 1; \
+	}
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
-	$(MAKE) cleanup-test-e2e
+test-e2e: manifests generate fmt vet ## Run e2e tests only against the isolated Kind kubeconfig.
+	@set +e; \
+	$(MAKE) setup-test-e2e; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then \
+		KUBECONFIG="$(E2E_KUBECONFIG)" KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v; \
+		rc=$$?; \
+	fi; \
+	$(MAKE) cleanup-test-e2e; \
+	cleanup_rc=$$?; \
+	if [ $$rc -eq 0 ]; then rc=$$cleanup_rc; fi; \
+	exit $$rc
 
 .PHONY: cleanup-test-e2e
-cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
+cleanup-test-e2e: ## Tear down the Kind cluster and remove its dedicated kubeconfig
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+	@rm -f "$(E2E_KUBECONFIG)"
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
