@@ -2,9 +2,17 @@ name: E2E Tests
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 permissions: {}
+
+# A PR commit is validated once through pull_request. New commits cancel stale
+# validation for the same ref instead of consuming runners on obsolete code.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test-e2e:
