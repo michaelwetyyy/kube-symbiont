@@ -268,21 +268,22 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if degradedReason != "" {
 		meta.SetStatusCondition(&sw.Status.Conditions, metav1.Condition{
 			Type: conditionReady, Status: metav1.ConditionFalse, Reason: degradedReason,
-			Message: degradedMsg,
+			ObservedGeneration: sw.Generation, Message: degradedMsg,
 		})
 		meta.SetStatusCondition(&sw.Status.Conditions, metav1.Condition{
 			Type: conditionDegraded, Status: metav1.ConditionTrue, Reason: degradedReason,
-			Message: degradedMsg,
+			ObservedGeneration: sw.Generation, Message: degradedMsg,
 		})
 	} else {
 		meta.SetStatusCondition(&sw.Status.Conditions, metav1.Condition{
 			Type: conditionReady, Status: metav1.ConditionTrue, Reason: readyReason,
+			ObservedGeneration: sw.Generation,
 			Message: fmt.Sprintf("tracking node %q at cpu=%s memory=%s",
 				sw.Spec.Node, sw.Status.CurrentCPU.String(), sw.Status.CurrentMemory.String()),
 		})
 		meta.SetStatusCondition(&sw.Status.Conditions, metav1.Condition{
 			Type: conditionDegraded, Status: metav1.ConditionFalse, Reason: reasonAsExpected,
-			Message: "phantom tracking nominal",
+			ObservedGeneration: sw.Generation, Message: "phantom tracking nominal",
 		})
 	}
 
