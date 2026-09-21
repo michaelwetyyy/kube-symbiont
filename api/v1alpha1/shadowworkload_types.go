@@ -330,10 +330,13 @@ type ShadowWorkloadStatus struct {
 // +kubebuilder:resource:scope=Namespaced,shortName=sw
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=".spec.node"
 // +kubebuilder:printcolumn:name="Source",type=string,JSONPath=".spec.source.type"
-// +kubebuilder:printcolumn:name="Phantom",type=string,JSONPath=".status.phantomPod"
-// +kubebuilder:printcolumn:name="CPU",type=string,JSONPath=".status.currentCPU"
-// +kubebuilder:printcolumn:name="Memory",type=string,JSONPath=".status.currentMemory"
+// +kubebuilder:printcolumn:name="ReserveCPU",type=string,JSONPath=".status.currentCPU"
+// +kubebuilder:printcolumn:name="ReserveMem",type=string,JSONPath=".status.currentMemory"
+// +kubebuilder:printcolumn:name="MeasuredCPU",type=string,JSONPath=".status.lastMeasurement.cpu"
+// +kubebuilder:printcolumn:name="MeasuredMem",type=string,JSONPath=".status.lastMeasurement.memory"
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status"
+// +kubebuilder:printcolumn:name="Phantom",type=string,JSONPath=".status.phantomPod",priority=1
+// +kubebuilder:printcolumn:name="MeasuredAt",type="date",JSONPath=".status.lastMeasurement.time",priority=1
 
 // ShadowWorkload maintains a phantom ("ballast") pod whose resource requests
 // mirror the real footprint of a bare-metal workload, making that footprint

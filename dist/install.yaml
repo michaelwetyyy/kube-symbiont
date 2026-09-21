@@ -43,18 +43,29 @@ spec:
     - jsonPath: .spec.source.type
       name: Source
       type: string
-    - jsonPath: .status.phantomPod
-      name: Phantom
-      type: string
     - jsonPath: .status.currentCPU
-      name: CPU
+      name: ReserveCPU
       type: string
     - jsonPath: .status.currentMemory
-      name: Memory
+      name: ReserveMem
+      type: string
+    - jsonPath: .status.lastMeasurement.cpu
+      name: MeasuredCPU
+      type: string
+    - jsonPath: .status.lastMeasurement.memory
+      name: MeasuredMem
       type: string
     - jsonPath: .status.conditions[?(@.type=='Ready')].status
       name: Ready
       type: string
+    - jsonPath: .status.phantomPod
+      name: Phantom
+      priority: 1
+      type: string
+    - jsonPath: .status.lastMeasurement.time
+      name: MeasuredAt
+      priority: 1
+      type: date
     name: v1alpha1
     schema:
       openAPIV3Schema:

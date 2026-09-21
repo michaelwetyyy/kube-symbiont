@@ -77,6 +77,8 @@ concrete source that produced that same observation (including cgroup path and c
 typed host sources). Measurement/source snapshots are retained during later backend failures; the
 `Ready` and `Degraded` conditions describe current health, so operators can distinguish stale
 last-known-good truth from a healthy fresh measurement.
+`kubectl get shadowworkloads` labels the two sides explicitly as `ReserveCPU`/`ReserveMem` and
+`MeasuredCPU`/`MeasuredMem`; `-o wide` also shows the phantom pod and last measurement time.
 
 ### CRD upgrade ordering
 
