@@ -19,6 +19,7 @@ package sources
 import (
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -279,6 +280,24 @@ func TestQueryPairRejectsPartialPair(t *testing.T) {
 				t.Fatalf("partial pair error = %v, want ErrPartialSample", err)
 			}
 		})
+	}
+}
+
+func TestResourceSampleBoundsAvoidQuantitySaturation(t *testing.T) {
+	cpuEdge := float64(math.MaxInt64) / 1000
+	if validCPUResourceSample(cpuEdge) {
+		t.Fatalf("CPU edge %.17g must be rejected because millicore conversion can saturate int64", cpuEdge)
+	}
+	if safe := math.Nextafter(cpuEdge, 0); !validCPUResourceSample(safe) {
+		t.Fatalf("next CPU float below overflow edge %.17g should remain representable", safe)
+	}
+
+	memoryEdge := float64(math.MaxInt64)
+	if validMemoryResourceSample(memoryEdge) {
+		t.Fatalf("memory edge %.17g must be rejected because it rounds to 2^63", memoryEdge)
+	}
+	if safe := math.Nextafter(memoryEdge, 0); !validMemoryResourceSample(safe) {
+		t.Fatalf("next memory float below overflow edge %.17g should remain representable", safe)
 	}
 }
 

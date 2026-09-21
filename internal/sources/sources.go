@@ -312,7 +312,10 @@ func (c *Client) QueryPair(ctx context.Context, q Queries) (cpuCores, memoryByte
 }
 
 func validCPUResourceSample(value float64) bool {
-	return validFiniteNonNegative(value) && value <= float64(math.MaxInt64/1000)
+	// float64(MaxInt64) rounds to 2^63. Step down from the CPU value whose
+	// conversion to millicores could round back to that unrepresentable edge.
+	maxCPU := math.Nextafter(float64(math.MaxInt64)/1000, 0)
+	return validFiniteNonNegative(value) && value <= maxCPU
 }
 
 func validMemoryResourceSample(value float64) bool {
