@@ -46,6 +46,10 @@ const metricsServiceName = "kube-symbiont-controller-manager-metrics-service"
 // metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
 const metricsRoleBindingName = "kube-symbiont-metrics-binding"
 
+// e2eInstallerPath is deliberately outside dist/ so E2E image substitution
+// can never dirty the tracked release installer.
+const e2eInstallerPath = "bin/e2e-install.yaml"
+
 func upgradeShadowWorkloadManifest(namespace, sourceType string) string {
 	source := `type: promql
     promql:
@@ -87,7 +91,7 @@ var _ = Describe("Manager", Ordered, func() {
 	// begins from a legacy CRD rather than masking schema transition failures.
 	BeforeAll(func() {
 		By("generating the self-contained installer")
-		cmd := exec.Command("make", "build-installer", fmt.Sprintf("IMG=%s", managerImage))
+		cmd := exec.Command("make", "build-installer", fmt.Sprintf("IMG=%s", managerImage), fmt.Sprintf("INSTALLER=%s", e2eInstallerPath))
 		_, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to generate the installer")
 	})
@@ -107,8 +111,9 @@ var _ = Describe("Manager", Ordered, func() {
 		_, _ = utils.Run(cmd)
 
 		By("deleting the exact consolidated installer")
-		cmd = exec.Command("kubectl", "delete", "-f", "dist/install.yaml", "--ignore-not-found")
+		cmd = exec.Command("kubectl", "delete", "-f", e2eInstallerPath, "--ignore-not-found")
 		_, _ = utils.Run(cmd)
+		_ = os.Remove(e2eInstallerPath)
 	})
 
 	// After each test, check for failures and collect logs, events,
@@ -248,7 +253,7 @@ var _ = Describe("Manager", Ordered, func() {
 
 		It("should install the current release from one self-contained manifest", func() {
 			By("installing every prerequisite and the manager from one manifest")
-			cmd := exec.Command("kubectl", "apply", "-f", "dist/install.yaml")
+			cmd := exec.Command("kubectl", "apply", "-f", e2eInstallerPath)
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to apply the installer")
 

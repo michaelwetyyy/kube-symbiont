@@ -837,7 +837,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: example.com/kube-symbiont:v0.0.1
+        image: ghcr.io/michaelwetyyy/kube-symbiont:0.1.0
         livenessProbe:
           httpGet:
             path: /healthz

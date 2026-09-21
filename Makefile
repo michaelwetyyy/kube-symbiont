@@ -1,6 +1,7 @@
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
 INSTALLER_IMG ?= ghcr.io/michaelwetyyy/kube-symbiont:0.1.0
+INSTALLER ?= dist/install.yaml
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -171,10 +172,10 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
-	mkdir -p dist
-	"$(KUSTOMIZE)" build config/symbiont > dist/install.yaml
-	printf '%s\n' '---' >> dist/install.yaml
-	"$(KUSTOMIZE)" build config/default | sed 's|image: controller:latest|image: ${IMG}|' >> dist/install.yaml
+	mkdir -p "$(dir $(INSTALLER))"
+	"$(KUSTOMIZE)" build config/symbiont > "$(INSTALLER)"
+	printf '%s\n' '---' >> "$(INSTALLER)"
+	"$(KUSTOMIZE)" build config/default | sed 's|image: controller:latest|image: ${IMG}|' >> "$(INSTALLER)"
 
 .PHONY: verify-installer
 verify-installer: IMG=$(INSTALLER_IMG)
