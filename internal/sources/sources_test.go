@@ -27,6 +27,11 @@ import (
 	symbiontv1alpha1 "github.com/michaelwetyyy/kube-symbiont/api/v1alpha1"
 )
 
+const (
+	testCPUQuery    = "cpu"
+	testMemoryQuery = "mem"
+)
+
 func dockerSpec(job, instance string) *symbiontv1alpha1.ShadowWorkloadSpec {
 	return &symbiontv1alpha1.ShadowWorkloadSpec{
 		Node: "lab",
@@ -147,11 +152,11 @@ func TestClientQuery(t *testing.T) {
 			wantVal: 0, wantFound: false,
 		},
 		{
-			name: "NaN sample treated as absent",
+			name: "NaN sample rejected",
 			handler: func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"NaN"]}]}}`))
 			},
-			wantFound: false,
+			wantErr: true,
 		},
 		{
 			name: "prom error status",
@@ -223,25 +228,90 @@ func TestClientQuery(t *testing.T) {
 	}
 }
 
-func TestQueryPairCombines(t *testing.T) {
+func TestQueryPairCombinesCompletePair(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("query") {
-		case "cpu":
+		case testCPUQuery:
 			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"2"]}]}}`))
-		case "mem":
-			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+		case testMemoryQuery:
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"4096"]}]}}`))
 		default:
 			t.Errorf("unexpected query %q", r.URL.Query().Get("query"))
 		}
 	}))
 	defer srv.Close()
 	c, _ := NewClient(srv.URL, 0)
-	cpu, mem, found, err := c.QueryPair(context.Background(), Queries{CPUCores: "cpu", MemoryBytes: "mem"})
+	cpu, mem, found, err := c.QueryPair(context.Background(), Queries{CPUCores: testCPUQuery, MemoryBytes: testMemoryQuery})
 	if err != nil {
 		t.Fatalf("QueryPair: %v", err)
 	}
-	if cpu != 2 || mem != 0 || !found {
-		t.Fatalf("got cpu=%v mem=%v found=%v, want 2/0/true", cpu, mem, found)
+	if cpu != 2 || mem != 4096 || !found {
+		t.Fatalf("got cpu=%v mem=%v found=%v, want 2/4096/true", cpu, mem, found)
+	}
+}
+
+func TestQueryPairAllowsFullyAbsentPair(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+	}))
+	defer srv.Close()
+	c, _ := NewClient(srv.URL, 0)
+	cpu, mem, found, err := c.QueryPair(context.Background(), Queries{CPUCores: testCPUQuery, MemoryBytes: testMemoryQuery})
+	if err != nil || cpu != 0 || mem != 0 || found {
+		t.Fatalf("fully absent pair = (%v,%v,%v,%v), want 0/0/false/nil", cpu, mem, found, err)
+	}
+}
+
+func TestQueryPairRejectsPartialPair(t *testing.T) {
+	for _, missing := range []string{testCPUQuery, testMemoryQuery} {
+		t.Run("missing "+missing, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("query") == missing {
+					_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"1"]}]}}`))
+			}))
+			defer srv.Close()
+			c, _ := NewClient(srv.URL, 0)
+			_, _, _, err := c.QueryPair(context.Background(), Queries{CPUCores: testCPUQuery, MemoryBytes: testMemoryQuery})
+			if !errors.Is(err, ErrPartialSample) {
+				t.Fatalf("partial pair error = %v, want ErrPartialSample", err)
+			}
+		})
+	}
+}
+
+func TestQueryPairRejectsInvalidResourceValues(t *testing.T) {
+	tests := []struct {
+		name string
+		cpu  string
+		mem  string
+	}{
+		{name: "negative cpu", cpu: "-0.1", mem: "1024"},
+		{name: "negative memory", cpu: "1", mem: "-1"},
+		{name: "both NaN", cpu: prometheusNaN, mem: prometheusNaN},
+		{name: "positive infinity", cpu: "+Inf", mem: "1024"},
+		{name: "negative infinity", cpu: "1", mem: "-Inf"},
+		{name: "cpu quantity overflow", cpu: "1e20", mem: "1024"},
+		{name: "memory quantity overflow", cpu: "1", mem: "1e30"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				value := tt.cpu
+				if r.URL.Query().Get("query") == testMemoryQuery {
+					value = tt.mem
+				}
+				_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"` + value + `"]}]}}`))
+			}))
+			defer srv.Close()
+			c, _ := NewClient(srv.URL, 0)
+			_, _, _, err := c.QueryPair(context.Background(), Queries{CPUCores: testCPUQuery, MemoryBytes: testMemoryQuery})
+			if !errors.Is(err, ErrInvalidSample) {
+				t.Fatalf("invalid pair error = %v, want ErrInvalidSample", err)
+			}
+		})
 	}
 }
 

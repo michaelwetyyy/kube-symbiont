@@ -63,6 +63,13 @@ const (
 	// sample; the controller refuses to pick one silently.
 	FailureMultiSample FailureReason = "multi_sample"
 
+	// FailurePartialSample marks a CPU/memory pair where only one dimension
+	// produced a series; the controller preserves the previous reservation.
+	FailurePartialSample FailureReason = "partial_sample"
+
+	// FailureInvalidSample marks a negative, non-finite or unrepresentable sample.
+	FailureInvalidSample FailureReason = "invalid_sample"
+
 	// FailureResizeRejected marks an in-place resize rejected by the API
 	// server; the phantom keeps its last accepted requests.
 	FailureResizeRejected FailureReason = "resize_rejected"
@@ -76,6 +83,8 @@ const (
 var knownFailureReasons = map[FailureReason]struct{}{
 	FailurePrometheusUnavailable: {},
 	FailureMultiSample:           {},
+	FailurePartialSample:         {},
+	FailureInvalidSample:         {},
 	FailureResizeRejected:        {},
 	FailureSourceMissing:         {},
 }

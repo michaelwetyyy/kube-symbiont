@@ -109,10 +109,12 @@ func TestFailureReasonEnumBounds(t *testing.T) {
 	allowed := map[FailureReason]struct{}{
 		FailurePrometheusUnavailable: {},
 		FailureMultiSample:           {},
+		FailurePartialSample:         {},
+		FailureInvalidSample:         {},
 		FailureResizeRejected:        {},
 		FailureSourceMissing:         {},
 	}
-	if len(allowed) != 4 {
+	if len(allowed) != 6 {
 		t.Fatalf("enum cardinality changed: %d reasons", len(allowed))
 	}
 	for reason := range allowed {
@@ -191,7 +193,8 @@ func TestNoExtraLabelsEverAppear(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	_ = rec.Register(reg)
 	for _, reason := range []FailureReason{
-		FailurePrometheusUnavailable, FailureMultiSample, FailureResizeRejected, FailureSourceMissing,
+		FailurePrometheusUnavailable, FailureMultiSample, FailurePartialSample, FailureInvalidSample,
+		FailureResizeRejected, FailureSourceMissing,
 	} {
 		rec.ObservedMeasurement("ns", "name-with-\"quotes\"", 1, 2)
 		rec.MeasurementFailed("ns", `back\slash`, reason)
