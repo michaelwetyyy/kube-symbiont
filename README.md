@@ -68,7 +68,6 @@ Exactly one source per ShadowWorkload; each resolves to a CPU-cores + memory-byt
 
 CPU and memory are treated as one accounting snapshot: both series may be absent together (the workload is off), but a partial pair or a negative/non-finite/unrepresentable value is rejected and the phantom keeps its last accepted reservation.
 
-CPU and memory are treated as one accounting snapshot: both series may be absent together (the workload is off), but a partial pair or a negative/non-finite value is rejected and the phantom keeps its last accepted reservation.
 
 ### Operational status
 
