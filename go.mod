@@ -1,6 +1,6 @@
 module github.com/michaelwetyyy/kube-symbiont
 
-go 1.26.7
+go 1.26.0
 
 require (
 	github.com/go-logr/zapr v1.3.0

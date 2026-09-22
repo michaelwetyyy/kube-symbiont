@@ -70,7 +70,7 @@ CPU and memory are treated as one accounting snapshot: both series may be absent
 
 ## Quickstart
 
-Prerequisites: Go 1.26.7+ (go.mod declares go 1.26.7), kubectl, kustomize (Makefile fetches tools locally), and a cluster
+Prerequisites: Go 1.26+ (go.mod declares go 1.26.0), kubectl, kustomize (Makefile fetches tools locally), and a cluster
 running Kubernetes ≥ 1.29 with Prometheus already scraping cAdvisor.
 
 ```sh
