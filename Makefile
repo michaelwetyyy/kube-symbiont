@@ -52,6 +52,14 @@ manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and Cust
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	"$(CONTROLLER_GEN)" object:headerFile="hack/boilerplate.go.txt",year=$(YEAR) paths="./..."
 
+.PHONY: sync-helm-crd
+sync-helm-crd: manifests ## Regenerate the Helm CRD template from controller-gen output.
+	python3 -B hack/sync_helm_crd.py --write
+
+.PHONY: verify-helm-crd
+verify-helm-crd: manifests ## Verify the Helm CRD template matches controller-gen output.
+	python3 -B hack/sync_helm_crd.py --check
+
 .PHONY: fmt
 fmt: ## Run go fmt against code.
 	go fmt ./...
@@ -153,6 +161,7 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 .PHONY: verify-installer
 verify-installer: IMG=$(INSTALLER_IMG)
 verify-installer: build-installer ## Regenerate and verify the fresh-install resource inventory.
+	python3 -B hack/sync_helm_crd.py --check
 	go test ./internal/install
 
 ##@ Deployment

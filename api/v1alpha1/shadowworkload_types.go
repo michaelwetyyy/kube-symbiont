@@ -152,12 +152,15 @@ type CgroupSource struct {
 	CadvisorInstance string `json:"cadvisorInstance"`
 }
 
-// SystemdSource resolves one systemd unit to /system.slice/<unit> on a
-// cgroup-v2/systemd host.
+// SystemdSource resolves a simple system-manager service or scope unit in the
+// default system.slice to /system.slice/<unit> on a cgroup-v2/systemd host.
+// Units placed in custom slices, instantiated @ units, and slice units should
+// use the explicit cgroup source because their cgroup path is not this simple.
 type SystemdSource struct {
-	// unit is a systemd unit name such as minecraft.service. Path separators
-	// and glob metacharacters are rejected.
-	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.:@\-]+\.(service|scope|slice)$`
+	// unit is a simple system-manager service or scope unit such as
+	// minecraft.service. Path separators, template/instance markers and slice
+	// units are rejected; use source.cgroup for those layouts.
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_.:\-]+\.(service|scope)$`
 	Unit string `json:"unit"`
 
 	// cadvisorJob is the Prometheus job label emitted by standalone cAdvisor.

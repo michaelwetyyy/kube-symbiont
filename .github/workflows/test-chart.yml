@@ -46,6 +46,9 @@ jobs:
       - name: Install Helm
         run: make install-helm
 
+      - name: Verify generated Helm CRD
+        run: make verify-helm-crd
+
       - name: Lint Helm Chart
         run: |
           helm lint ./charts/chart
