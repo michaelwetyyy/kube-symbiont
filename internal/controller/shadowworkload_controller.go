@@ -324,8 +324,13 @@ func (r *ShadowWorkloadReconciler) measure(
 	cpu, mem, found, qerr := querier.QueryPair(qctx, queries)
 	if qerr != nil {
 		reason := metrics.FailurePrometheusUnavailable
-		if errors.Is(qerr, sources.ErrMultiSample) {
+		switch {
+		case errors.Is(qerr, sources.ErrMultiSample):
 			reason = metrics.FailureMultiSample
+		case errors.Is(qerr, sources.ErrPartialSample):
+			reason = metrics.FailurePartialSample
+		case errors.Is(qerr, sources.ErrInvalidSample):
+			reason = metrics.FailureInvalidSample
 		}
 		r.Metrics.MeasurementFailed(sw.Namespace, sw.Name, reason)
 		setDegraded(reasonPrometheusUnavailable, "metrics backend query failed")

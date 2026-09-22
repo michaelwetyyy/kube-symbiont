@@ -462,6 +462,27 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(meta.IsStatusConditionFalse(recovered.Status.Conditions, "Degraded")).To(BeTrue())
 	})
 
+	It("should retain last truth for an incomplete resource measurement", func() {
+		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		before := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, before)).To(Succeed())
+		lastResize := before.Status.LastResize
+		stub.err = sources.ErrPartialSample
+		stub.cpu, stub.mem = 8, 0
+
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		after := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, after)).To(Succeed())
+		Expect(after.Status.CurrentCPU.String()).To(Equal("2"))
+		Expect(after.Status.CurrentMemory.String()).To(Equal("6Gi"))
+		Expect(after.Status.LastResize.Equal(&lastResize)).To(BeTrue())
+		Expect(meta.FindStatusCondition(after.Status.Conditions, "Degraded").Reason).To(Equal("PrometheusUnavailable"))
+	})
+
 	It("should return status patch failures so controller-runtime retries", func() {
 		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
 		failing := *reconciler

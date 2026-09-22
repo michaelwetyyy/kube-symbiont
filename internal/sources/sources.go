@@ -49,6 +49,8 @@ type Queries struct {
 // cgroup id prefix /system.slice/docker-<id>.
 const dockerCgroupIDSelector = `id=~"/system.slice/docker-.*"`
 
+const prometheusNaN = "NaN"
+
 // windowPattern mirrors the CRD validation pattern for range windows;
 // re-validated here so generated queries can never embed arbitrary strings.
 var windowPattern = regexp.MustCompile(`^([0-9]+(\.[0-9]+)?(ms|s|m|h))+$`)
@@ -59,6 +61,15 @@ var cgroupPathPattern = regexp.MustCompile(`^/[A-Za-z0-9_.:@\-/*]+$`)
 // Callers classify it with errors.Is instead of parsing error text, keeping
 // failure reporting bounded and label-safe.
 var ErrMultiSample = errors.New("multi-sample result")
+
+// ErrPartialSample marks a pair where exactly one resource dimension produced
+// a series. Applying the present half while treating the other as zero can
+// under-reserve the missing dimension, so callers must preserve last truth.
+var ErrPartialSample = errors.New("partial resource measurement")
+
+// ErrInvalidSample marks a non-finite, negative or unrepresentable CPU/memory
+// measurement. Such values must never reach Kubernetes resource quantities.
+var ErrInvalidSample = errors.New("invalid resource measurement")
 
 // Resolve turns a validated ShadowWorkloadSpec into its PromQL pair.
 func Resolve(spec *symbiontv1alpha1.ShadowWorkloadSpec) (Queries, error) {
@@ -270,13 +281,15 @@ func (c *Client) Query(ctx context.Context, expr string) (float64, bool, error) 
 		return 0, false, err
 	}
 	if math.IsNaN(value) {
-		// No data at eval time; treat like an empty vector.
-		return 0, false, nil
+		return 0, false, ErrInvalidSample
 	}
 	return value, true, nil
 }
 
-// QueryPair resolves both halves of a Queries pair in sequence.
+// QueryPair resolves both halves of a Queries pair in sequence. Both resource
+// dimensions must have the same presence state: a fully absent pair means the
+// workload is off, while a partial pair is unsafe because zeroing only one side
+// could shrink that reservation below real usage.
 func (c *Client) QueryPair(ctx context.Context, q Queries) (cpuCores, memoryBytes float64, found bool, err error) {
 	cpu, cpuFound, err := c.Query(ctx, q.CPUCores)
 	if err != nil {
@@ -286,7 +299,32 @@ func (c *Client) QueryPair(ctx context.Context, q Queries) (cpuCores, memoryByte
 	if err != nil {
 		return 0, 0, false, fmt.Errorf("memory query: %w", err)
 	}
-	return cpu, mem, cpuFound || memFound, nil
+	if cpuFound != memFound {
+		return 0, 0, false, fmt.Errorf("%w: cpu present=%t memory present=%t", ErrPartialSample, cpuFound, memFound)
+	}
+	if !cpuFound {
+		return 0, 0, false, nil
+	}
+	if !validCPUResourceSample(cpu) || !validMemoryResourceSample(mem) {
+		return 0, 0, false, ErrInvalidSample
+	}
+	return cpu, mem, true, nil
+}
+
+func validCPUResourceSample(value float64) bool {
+	// float64(MaxInt64) rounds to 2^63. Step down from the CPU value whose
+	// conversion to millicores could round back to that unrepresentable edge.
+	maxCPU := math.Nextafter(float64(math.MaxInt64)/1000, 0)
+	return validFiniteNonNegative(value) && value <= maxCPU
+}
+
+func validMemoryResourceSample(value float64) bool {
+	maxInt64Float := math.Nextafter(float64(math.MaxInt64), 0)
+	return validFiniteNonNegative(value) && value <= maxInt64Float
+}
+
+func validFiniteNonNegative(value float64) bool {
+	return value >= 0 && !math.IsInf(value, 0) && !math.IsNaN(value)
 }
 
 func parseSample(s string) (float64, error) {
@@ -295,7 +333,7 @@ func parseSample(s string) (float64, error) {
 		return math.Inf(1), nil
 	case "-Inf":
 		return math.Inf(-1), nil
-	case "NaN":
+	case prometheusNaN:
 		return math.NaN(), nil
 	}
 	v, err := strconv.ParseFloat(s, 64)

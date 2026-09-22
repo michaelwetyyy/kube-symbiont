@@ -66,6 +66,8 @@ Exactly one source per ShadowWorkload; each resolves to a CPU-cores + memory-byt
 - **`cgroup`** — typed cgroup-v2 path or bounded `*` path glob, pinned to one standalone cAdvisor target.
 - **`systemd`** — typed systemd unit source (for example `minecraft.service`), resolved to its `/system.slice/<unit>` cgroup and pinned to one standalone cAdvisor target.
 
+CPU and memory are treated as one accounting snapshot: both series may be absent together (the workload is off), but a partial pair or a negative/non-finite/unrepresentable value is rejected and the phantom keeps its last accepted reservation.
+
 ## Quickstart
 
 Prerequisites: Go 1.26+ (go.mod declares go 1.26.0), kubectl, kustomize (Makefile fetches tools locally), and a cluster
