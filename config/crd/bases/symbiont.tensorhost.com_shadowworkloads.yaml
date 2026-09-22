@@ -195,9 +195,10 @@ spec:
                         type: string
                       unit:
                         description: |-
-                          unit is a systemd unit name such as minecraft.service. Path separators
-                          and glob metacharacters are rejected.
-                        pattern: ^[A-Za-z0-9_.:@\-]+\.(service|scope|slice)$
+                          unit is a simple system-manager service or scope unit such as
+                          minecraft.service. Path separators, template/instance markers and slice
+                          units are rejected; use source.cgroup for those layouts.
+                        pattern: ^[A-Za-z0-9_.:\-]+\.(service|scope)$
                         type: string
                     required:
                     - cadvisorInstance

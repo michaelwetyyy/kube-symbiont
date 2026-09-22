@@ -54,7 +54,7 @@ const prometheusNaN = "NaN"
 // windowPattern mirrors the CRD validation pattern for range windows;
 // re-validated here so generated queries can never embed arbitrary strings.
 var windowPattern = regexp.MustCompile(`^([0-9]+(\.[0-9]+)?(ms|s|m|h))+$`)
-var systemdUnitPattern = regexp.MustCompile(`^[A-Za-z0-9_.:@\-]+\.(service|scope|slice)$`)
+var systemdUnitPattern = regexp.MustCompile(`^[A-Za-z0-9_.:\-]+\.(service|scope)$`)
 var cgroupPathPattern = regexp.MustCompile(`^/[A-Za-z0-9_.:@\-/*]+$`)
 
 // ErrMultiSample marks a query that resolved to more than one vector sample.

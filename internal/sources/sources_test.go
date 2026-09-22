@@ -432,6 +432,8 @@ func TestResolveCgroupGlobIsAnchoredAndEscaped(t *testing.T) {
 func TestResolveTypedHostSourcesRejectUnsafeInputs(t *testing.T) {
 	tests := []symbiontv1alpha1.SourceSpec{
 		{Type: symbiontv1alpha1.SourceTypeSystemd, Systemd: &symbiontv1alpha1.SystemdSource{Unit: "../minecraft.service", CadvisorInstance: "x"}},
+		{Type: symbiontv1alpha1.SourceTypeSystemd, Systemd: &symbiontv1alpha1.SystemdSource{Unit: "worker@blue.service", CadvisorInstance: "x"}},
+		{Type: symbiontv1alpha1.SourceTypeSystemd, Systemd: &symbiontv1alpha1.SystemdSource{Unit: "batch.slice", CadvisorInstance: "x"}},
 		{Type: symbiontv1alpha1.SourceTypeSystemd, Systemd: &symbiontv1alpha1.SystemdSource{Unit: "minecraft.service", CadvisorInstance: ""}},
 		{Type: symbiontv1alpha1.SourceTypeCgroup, Cgroup: &symbiontv1alpha1.CgroupSource{Path: "/system.slice//bad.service", CadvisorInstance: "x"}},
 		{Type: symbiontv1alpha1.SourceTypeCgroup, Cgroup: &symbiontv1alpha1.CgroupSource{Path: "/system.slice/x.service", CadvisorInstance: ""}},

@@ -259,6 +259,21 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(apierrors.IsInvalid(err)).To(BeTrue())
 	})
 
+	DescribeTable("should reject systemd units whose cgroup path is not the simple system.slice form",
+		func(unit string) {
+			bad := validShadowWorkload("systemd-complex-unit")
+			bad.Spec.Source = symbiontv1alpha1.SourceSpec{
+				Type:    symbiontv1alpha1.SourceTypeSystemd,
+				Systemd: &symbiontv1alpha1.SystemdSource{Unit: unit, CadvisorInstance: testCadvisorTarget},
+			}
+			err := k8sClient.Create(ctx, bad)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+		},
+		Entry("slice hierarchy", "batch.slice"),
+		Entry("instantiated service", "worker@blue.service"),
+	)
+
 	It("should admit typed systemd source and reject mismatched source blocks", func() {
 		good := validShadowWorkload("systemd-source")
 		good.Spec.Source = symbiontv1alpha1.SourceSpec{

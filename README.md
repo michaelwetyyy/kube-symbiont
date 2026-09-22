@@ -64,7 +64,7 @@ Exactly one source per ShadowWorkload; each resolves to a CPU-cores + memory-byt
   cgroup tree and k8s pod series carry `image` labels too.)
 - **`promql`** — raw CPU/memory query passthrough; escape hatch for anything else.
 - **`cgroup`** — typed cgroup-v2 path or bounded `*` path glob, pinned to one standalone cAdvisor target.
-- **`systemd`** — typed systemd unit source (for example `minecraft.service`), resolved to its `/system.slice/<unit>` cgroup and pinned to one standalone cAdvisor target.
+- **`systemd`** — typed shortcut for simple system-manager `.service` / `.scope` units in the default `system.slice` (for example `minecraft.service`), resolved to `/system.slice/<unit>` and pinned to one standalone cAdvisor target. Use `cgroup` for `.slice` units, instantiated `@` units, or services/scopes assigned to a custom `Slice=`.
 
 CPU and memory are treated as one accounting snapshot: both series may be absent together (the workload is off), but a partial pair or a negative/non-finite/unrepresentable value is rejected and the phantom keeps its last accepted reservation.
 
