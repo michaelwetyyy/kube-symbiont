@@ -105,24 +105,100 @@ def verify_safe_candidate_inputs(text: str, path: pathlib.Path) -> None:
         )
 
 
+def verify_safe_release_inputs(text: str, path: pathlib.Path) -> None:
+    allowed = {
+        "RELEASE_TAG: ${{ inputs.release_tag }}",
+        "CANDIDATE_TAG: ${{ inputs.candidate_tag }}",
+        "EXPECTED_DIGEST: ${{ inputs.expected_candidate_digest }}",
+        "EXPECTED_SHA: ${{ inputs.expected_sha }}",
+        "ref: ${{ inputs.expected_sha }}",
+    }
+    unsafe = [
+        line.strip()
+        for line in text.splitlines()
+        if "${{ inputs." in line and line.strip() not in allowed
+    ]
+    if unsafe:
+        raise ValueError(
+            f"{path.name} interpolates dispatch inputs outside an env/ref boundary: "
+            f"{unsafe}"
+        )
+
+
+def verify_stable_promotion_workflow(text: str, path: pathlib.Path) -> None:
+    # Stable is a promotion of the already scanned/attested candidate OCI index.
+    # Rebuilding here would produce a different artifact from the one that soaked.
+    forbidden = (
+        "docker/build-push-action",
+        "Build untagged stable digest",
+        "Scan stable digest",
+        "push-by-digest=true",
+        "name-canonical=true",
+    )
+    present = [contract for contract in forbidden if contract in text]
+    if present:
+        raise ValueError(
+            f"{path.name} must promote the tested candidate without rebuilding: {present}"
+        )
+
+    required = (
+        "workflow_dispatch:",
+        "release_tag:",
+        "candidate_tag:",
+        "expected_candidate_digest:",
+        "expected_sha:",
+        'test "${CANDIDATE_TAG%-rc.*}" = "$RELEASE_TAG"',
+        'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"',
+        "refs/remotes/origin/main",
+        "Verify the tested candidate digest",
+        'candidate_ref="${IMAGE}:${CANDIDATE_TAG#v}"',
+        'test "$candidate_digest" = "$EXPECTED_DIGEST"',
+        "Promote exact candidate digest to stable image tags",
+        '--tag "$immutable_tag"',
+        '--tag "${IMAGE}:${minor}"',
+        '--tag "${IMAGE}:latest"',
+        '"${IMAGE}@${EXPECTED_DIGEST}"',
+        'test "$published_digest" = "$EXPECTED_DIGEST"',
+        "Create or verify immutable Git tag",
+        '-f ref="refs/tags/${RELEASE_TAG}"',
+        'test "$tag_sha" = "$EXPECTED_SHA"',
+        'make build-installer IMG="${IMAGE}@${EXPECTED_DIGEST}"',
+        "Create GitHub release",
+        "Promoted unchanged from ${CANDIDATE_TAG}",
+    )
+    missing = [contract for contract in required if contract not in text]
+    if missing:
+        raise ValueError(
+            f"{path.relative_to(ROOT)} is missing stable promotion contracts: {missing}"
+        )
+
+    require_in_order(
+        text,
+        path,
+        "Verify the tested candidate digest",
+        "Promote exact candidate digest to stable image tags",
+        "Create or verify immutable Git tag",
+        "Build digest-pinned installer",
+        "Create GitHub release",
+    )
+    verify_safe_release_inputs(text, path)
+
+
 def verify_workflow_contracts(root: pathlib.Path = ROOT) -> None:
     candidate_path = root / ".github/workflows/candidate.yml"
     release_path = root / ".github/workflows/release.yml"
     candidate = candidate_path.read_text()
     release = release_path.read_text()
 
-    shared = (
-        "group: kube-symbiont-image-publication",
-        "cancel-in-progress: false",
-        "push-by-digest=true",
-        "name-canonical=true",
-    )
     for path, text in ((candidate_path, candidate), (release_path, release)):
-        missing = [contract for contract in shared if contract not in text]
-        if missing:
-            raise ValueError(
-                f"{path.relative_to(ROOT)} is missing publication contracts: {missing}"
-            )
+        for contract in (
+            "group: kube-symbiont-image-publication",
+            "cancel-in-progress: false",
+        ):
+            if contract not in text:
+                raise ValueError(
+                    f"{path.relative_to(ROOT)} is missing publication contract {contract!r}"
+                )
 
         require_lines_in_order(
             text,
@@ -141,52 +217,29 @@ def verify_workflow_contracts(root: pathlib.Path = ROOT) -> None:
         )
 
     for contract in (
+        "push-by-digest=true",
+        "name-canonical=true",
         "expected_sha:",
         "ref: ${{ inputs.expected_sha }}",
         'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"',
         "refs/remotes/origin/main",
+        "Attest build provenance",
     ):
         if contract not in candidate:
             raise ValueError(f"candidate workflow is missing exact-source contract {contract!r}")
 
     verify_safe_candidate_inputs(candidate, candidate_path)
-
-    for contract in (
-        'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"',
-        'test "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")" = "$EXPECTED_SHA"',
-        "refs/remotes/origin/main",
-    ):
-        if contract not in release:
-            raise ValueError(f"release workflow is missing exact-source contract {contract!r}")
-
     require_count(candidate, candidate_path, "Could not prove candidate tag", 2)
-    require_count(release, release_path, "Could not prove stable tag", 2)
-
     require_in_order(
         candidate,
         candidate_path,
         "Build untagged candidate digest",
         "Scan candidate digest",
+        "Attest build provenance",
         "Promote scanned digest to immutable candidate tag",
     )
-    require_in_order(
-        release,
-        release_path,
-        "Build untagged stable digest",
-        "Scan stable digest",
-        "Promote scanned digest to stable tags",
-        "Create GitHub release",
-    )
 
-    for contract in (
-        '--tag "$immutable_tag"',
-        '--tag "${IMAGE}:${minor}"',
-        '--tag "${IMAGE}:latest"',
-        '"${IMAGE}@${IMAGE_DIGEST}"',
-        'for published_tag in "$immutable_tag" "${IMAGE}:${minor}" "${IMAGE}:latest"',
-    ):
-        if contract not in release:
-            raise ValueError(f"release workflow is missing stable-alias contract {contract!r}")
+    verify_stable_promotion_workflow(release, release_path)
 
 
 def verify_helm_image_contracts(root: pathlib.Path = ROOT) -> None:
