@@ -14,6 +14,8 @@ from hack.verify_release import (
     expected_versions,
     verify_helm_image_contracts,
     verify_safe_candidate_inputs,
+    verify_safe_release_inputs,
+    verify_stable_promotion_workflow,
     verify_workflow_contracts,
 )
 
@@ -80,6 +82,18 @@ class WorkflowContractTests(unittest.TestCase):
         unsafe = path.read_text() + '\n      run: echo "${{ inputs.image_tag }}"\n'
         with self.assertRaises(ValueError):
             verify_safe_candidate_inputs(unsafe, path)
+
+    def test_release_shell_interpolation_is_rejected(self) -> None:
+        path = ROOT / ".github/workflows/release.yml"
+        unsafe = path.read_text() + '\n      run: echo "${{ inputs.candidate_tag }}"\n'
+        with self.assertRaises(ValueError):
+            verify_safe_release_inputs(unsafe, path)
+
+    def test_stable_release_rebuild_is_rejected(self) -> None:
+        path = ROOT / ".github/workflows/release.yml"
+        unsafe = path.read_text() + "\n      uses: docker/build-push-action@deadbeef\n"
+        with self.assertRaises(ValueError):
+            verify_stable_promotion_workflow(unsafe, path)
 
     def test_helm_digest_contracts_are_present(self) -> None:
         verify_helm_image_contracts()

@@ -1,9 +1,24 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Stable Git tag to create, e.g. v0.2.0
+        required: true
+        type: string
+      candidate_tag:
+        description: Tested candidate tag to promote, e.g. v0.2.0-rc.4
+        required: true
+        type: string
+      expected_candidate_digest:
+        description: Exact tested OCI index digest (sha256:...)
+        required: true
+        type: string
+      expected_sha:
+        description: Exact main commit to tag and release
+        required: true
+        type: string
 
 permissions: {}
 
@@ -14,22 +29,33 @@ concurrency:
 
 jobs:
   release:
-    name: Gate, build, scan, attest, and release
+    name: Verify candidate and promote exact digest
     runs-on: ubuntu-latest
     permissions:
-      attestations: write
       contents: write
-      id-token: write
       packages: write
     env:
       IMAGE: ghcr.io/michaelwetyyy/kube-symbiont
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+      EXPECTED_DIGEST: ${{ inputs.expected_candidate_digest }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
     steps:
+      - name: Validate dispatch inputs
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$CANDIDATE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]
+          test "${CANDIDATE_TAG%-rc.*}" = "$RELEASE_TAG"
+          [[ "$EXPECTED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+
       - name: Clone the exact release source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.expected_sha }}
 
       - name: Setup Go
         uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
@@ -37,15 +63,9 @@ jobs:
           go-version-file: go.mod
 
       - name: Verify exact release source and repository gates
-        env:
-          EXPECTED_SHA: ${{ github.sha }}
-          RELEASE_TAG: ${{ github.ref_name }}
         shell: bash
         run: |
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-          test "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")" = "$EXPECTED_SHA"
           git fetch --no-tags origin \
             '+refs/heads/main:refs/remotes/origin/main'
           test "$(git rev-parse refs/remotes/origin/main)" = "$EXPECTED_SHA"
@@ -73,111 +93,76 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Reject an existing immutable stable tag
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
+      - name: Verify the tested candidate digest
         shell: bash
         run: |
-          immutable_tag="${IMAGE}:${RELEASE_TAG#v}"
-          if output="$(docker buildx imagetools inspect "$immutable_tag" 2>&1)"; then
-            echo "Refusing to replace existing stable tag: $immutable_tag" >&2
-            exit 1
-          fi
-          if [[ "$output" != *"not found"* && "$output" != *"manifest unknown"* ]]; then
-            echo "Could not prove stable tag is absent: $immutable_tag" >&2
-            printf '%s\n' "$output" >&2
-            exit 1
-          fi
+          candidate_ref="${IMAGE}:${CANDIDATE_TAG#v}"
+          candidate_digest="$(docker buildx imagetools inspect "$candidate_ref" | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"
+          test "$candidate_digest" = "$EXPECTED_DIGEST"
 
-      - name: Compute image labels
-        id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
-
-      # The stable tag and its moving aliases are created only after this
-      # untagged digest passes the vulnerability gate.
-      - name: Build untagged stable digest
-        id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        env:
-          EXPECTED_SHA: ${{ github.sha }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ env.RELEASE_TAG }}
-            VCS_REF=${{ env.EXPECTED_SHA }}
-          provenance: mode=max
-          sbom: true
-
-      - name: Scan stable digest
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
-        with:
-          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
-          format: table
-          exit-code: "1"
-          ignore-unfixed: true
-          severity: CRITICAL,HIGH
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
-        with:
-          subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
-
-      - name: Promote scanned digest to stable tags
-        env:
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-          RELEASE_TAG: ${{ github.ref_name }}
+      - name: Promote exact candidate digest to stable image tags
         shell: bash
         run: |
           version="${RELEASE_TAG#v}"
           minor="${version%.*}"
           immutable_tag="${IMAGE}:${version}"
+
           if output="$(docker buildx imagetools inspect "$immutable_tag" 2>&1)"; then
-            echo "Stable tag appeared during the run; refusing collision: $immutable_tag" >&2
-            exit 1
-          fi
-          if [[ "$output" != *"not found"* && "$output" != *"manifest unknown"* ]]; then
-            echo "Could not prove stable tag is still absent: $immutable_tag" >&2
+            existing_digest="$(printf '%s\n' "$output" | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"
+            test "$existing_digest" = "$EXPECTED_DIGEST"
+          elif [[ "$output" == *"not found"* || "$output" == *"manifest unknown"* ]]; then
+            docker buildx imagetools create \
+              --tag "$immutable_tag" \
+              "${IMAGE}@${EXPECTED_DIGEST}"
+          else
+            echo "Could not prove stable tag state: $immutable_tag" >&2
             printf '%s\n' "$output" >&2
             exit 1
           fi
+
+          # Moving aliases intentionally advance only after the immutable tag is proven.
           docker buildx imagetools create \
-            --tag "$immutable_tag" \
             --tag "${IMAGE}:${minor}" \
             --tag "${IMAGE}:latest" \
-            "${IMAGE}@${IMAGE_DIGEST}"
+            "${IMAGE}@${EXPECTED_DIGEST}"
+
           for published_tag in "$immutable_tag" "${IMAGE}:${minor}" "${IMAGE}:latest"; do
             published_digest="$(docker buildx imagetools inspect "$published_tag" | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"
-            test "$published_digest" = "$IMAGE_DIGEST"
+            test "$published_digest" = "$EXPECTED_DIGEST"
           done
 
-      - name: Build digest-pinned installer
+      - name: Create or verify immutable Git tag
         env:
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
-          make build-installer IMG="${IMAGE}@${IMAGE_DIGEST}"
+          if tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha' 2>/dev/null)"; then
+            test "$tag_sha" = "$EXPECTED_SHA"
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${RELEASE_TAG}" \
+              -f sha="$EXPECTED_SHA" >/dev/null
+          fi
+          tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object.sha')"
+          test "$tag_sha" = "$EXPECTED_SHA"
+
+      - name: Build digest-pinned installer
+        run: |
+          make build-installer IMG="${IMAGE}@${EXPECTED_DIGEST}"
           sha256sum dist/install.yaml > dist/install.yaml.sha256
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
         run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
           gh release create "$RELEASE_TAG" \
             dist/install.yaml dist/install.yaml.sha256 \
             --verify-tag \
             --title "kube-symbiont $RELEASE_TAG" \
             --generate-notes \
-            --notes "Experimental operator; Kubernetes 1.29+ required. Image: ${IMAGE}@${IMAGE_DIGEST}. Supported platforms: linux/amd64 and linux/arm64."
+            --notes "Experimental operator; Kubernetes 1.29+ required. Image: ${IMAGE}@${EXPECTED_DIGEST}. Promoted unchanged from ${CANDIDATE_TAG}. Supported platforms: linux/amd64 and linux/arm64."
