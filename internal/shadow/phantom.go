@@ -90,6 +90,16 @@ func PairOf(cpuCores, memoryBytes float64) symbiontv1alpha1.ResourcePair {
 	return symbiontv1alpha1.ResourcePair{CPU: *cpu, Memory: *mem}
 }
 
+// MeasurementPairOf converts a raw source observation into quantities for
+// durable status. Unlike PairOf, CPU is preserved to nanocore resolution so
+// sub-millicore measurements remain visible without changing scheduler
+// reservation granularity. Memory is retained to whole-byte resolution.
+func MeasurementPairOf(cpuCores, memoryBytes float64) symbiontv1alpha1.ResourcePair {
+	cpu := resource.NewScaledQuantity(int64(math.Round(cpuCores*1_000_000_000)), resource.Nano)
+	mem := resource.NewQuantity(int64(math.Round(memoryBytes)), resource.BinarySI)
+	return symbiontv1alpha1.ResourcePair{CPU: *cpu, Memory: *mem}
+}
+
 // Clamp constrains desired into [floor, ceiling] per dimension. A workload
 // that is off or emits nothing measures as zero and settles on the floor,
 // preserving a small standing reservation instead of dropping the phantom to

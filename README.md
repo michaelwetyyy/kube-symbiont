@@ -72,8 +72,9 @@ CPU and memory are treated as one accounting snapshot: both series may be absent
 ### Operational status
 
 `status.currentCPU` / `status.currentMemory` are the scheduler reservation currently held by the
-phantom. `status.lastMeasurement` records the most recent successful raw CPU/memory observation,
-its timestamp, whether the source returned an actual series, and the `observedGeneration` whose
+phantom. `status.lastMeasurement` records the most recent successful raw CPU/memory observation
+(CPU to nanocore resolution, memory to whole bytes), its timestamp, whether the source returned an
+actual series, and the `observedGeneration` whose
 source/metrics configuration produced it. `status.resolvedSource` records the concrete source that
 produced that same observation (including cgroup path and cAdvisor target for typed host sources).
 Measurement/source snapshots are retained during later backend failures; if a newer spec cannot be

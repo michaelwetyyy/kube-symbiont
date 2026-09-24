@@ -426,6 +426,30 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(meta.IsStatusConditionTrue(sw.Status.Conditions, conditionReady)).To(BeTrue())
 	})
 
+	It("should preserve sub-millicore CPU in status without changing scheduler reservation granularity", func() {
+		stub.cpu = 0.0000898010608132978
+		stub.mem = 3088384
+		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, updated)).To(Succeed())
+		Expect(updated.Status.CurrentCPU.String()).To(Equal("10m"))
+		Expect(updated.Status.CurrentMemory.String()).To(Equal("32Mi"))
+		Expect(updated.Status.LastMeasurement).NotTo(BeNil())
+		Expect(updated.Status.LastMeasurement.CPU.String()).To(Equal("89801n"))
+		Expect(updated.Status.LastMeasurement.Memory.Value()).To(Equal(int64(3088384)))
+		Expect(updated.Status.LastMeasurement.SeriesFound).To(BeTrue())
+
+		phantomKey := types.NamespacedName{Name: "shadow-" + resourceName, Namespace: key.Namespace}
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, phantomKey, pod)).To(Succeed())
+		Expect(pod.Spec.Containers[0].Resources.Requests.Cpu().String()).To(Equal("10m"))
+		Expect(pod.Spec.Containers[0].Resources.Requests.Memory().String()).To(Equal("32Mi"))
+	})
+
 	It("should floor the phantom when the workload emits nothing", func() {
 		stub.cpu, stub.mem = 0, 0
 		found := false

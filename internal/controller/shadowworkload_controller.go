@@ -347,7 +347,7 @@ func (r *ShadowWorkloadReconciler) measure(
 	r.Metrics.ObservedMeasurement(sw.Namespace, sw.Name, cpu, mem)
 	now := time.Now()
 	r.Metrics.MeasurementSucceeded(sw.Namespace, sw.Name, now)
-	measured := shadow.PairOf(cpu, mem)
+	measured := shadow.MeasurementPairOf(cpu, mem)
 	// Advance the measurement and its source description together. If a later
 	// source/backend failure occurs, both remain a coherent last-known-good
 	// snapshot while Conditions describe the current failure.
