@@ -66,7 +66,7 @@ Exactly one source per ShadowWorkload; each resolves to a CPU-cores + memory-byt
 - **`cgroup`** — typed cgroup-v2 path or bounded `*` path glob, pinned to one standalone cAdvisor target.
 - **`systemd`** — typed shortcut for simple system-manager `.service` / `.scope` units in the default `system.slice` (for example `minecraft.service`), resolved to `/system.slice/<unit>` and pinned to one standalone cAdvisor target. Use `cgroup` for `.slice` units, instantiated `@` units, or services/scopes assigned to a custom `Slice=`.
 
-CPU and memory are treated as one accounting snapshot: both series may be absent together (the workload is off), but a partial pair or a negative/non-finite/unrepresentable value is rejected and the phantom keeps its last accepted reservation.
+CPU and memory are treated as one accounting snapshot. For raw `promql`, both series may be absent together and that still means the workload is off. For typed `docker`/`cgroup`/`systemd` sources, an absent pair is accepted as off only when the exact pinned cAdvisor target also returns one `up == 1` sample; a down, absent, ambiguous, or failed target-health check fails closed and keeps the last accepted reservation. A partial pair or a negative/non-finite/unrepresentable value is likewise rejected.
 
 
 ### Operational status
@@ -214,8 +214,9 @@ make manifests generate   # regenerate CRDs/RBAC/deepcopy after API edits
   over-scheduled mid-resize (acknowledged upstream). Low risk at homelab scale.
 - **Polling delay.** Between a spike and the phantom's resize there is up to one
   `pollInterval` plus window smoothing of lag, by design.
-- **Prometheus dependency.** Measurement quality equals scrape coverage; a dead Prometheus
-  freezes the phantom at its last size rather than shrinking it.
+- **Prometheus/cAdvisor dependency.** Measurement quality equals scrape coverage; a dead Prometheus,
+  or a typed source whose exact pinned cAdvisor target is unavailable, freezes the phantom at its
+  last accepted size rather than shrinking it.
 - **Trusted configuration boundary.** A `ShadowWorkload` author selects the Prometheus URL and,
   for raw `promql`, the query. Grant CR write access only to trusted operators; do not expose it
   as an untrusted multi-tenant API. Write access is effectively node-capacity-administrator access:

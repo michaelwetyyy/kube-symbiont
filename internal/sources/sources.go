@@ -35,11 +35,14 @@ import (
 	symbiontv1alpha1 "github.com/michaelwetyyy/kube-symbiont/api/v1alpha1"
 )
 
-// Queries is a resolved pair of instant-query expressions returning CPU cores
-// and memory bytes respectively.
+// Queries is a resolved bundle of instant-query expressions. CPUCores and
+// MemoryBytes form the accounting pair. TargetHealth is set only for typed
+// cAdvisor-backed sources and is consulted when both accounting series are
+// absent, so a dead scrape target cannot be mistaken for a stopped workload.
 type Queries struct {
-	CPUCores    string
-	MemoryBytes string
+	CPUCores     string
+	MemoryBytes  string
+	TargetHealth string
 }
 
 // Description is the durable, human-readable resolution of a source. It is
@@ -114,6 +117,12 @@ var ErrPartialSample = errors.New("partial resource measurement")
 // measurement. Such values must never reach Kubernetes resource quantities.
 var ErrInvalidSample = errors.New("invalid resource measurement")
 
+// ErrTargetUnavailable marks an absent, unhealthy, ambiguous, or otherwise
+// untrustworthy health result for a typed source's pinned cAdvisor target.
+// Callers must preserve the last accepted reservation rather than interpret an
+// empty resource pair as a stopped workload.
+var ErrTargetUnavailable = errors.New("pinned cAdvisor target unavailable")
+
 // Resolve turns a validated ShadowWorkloadSpec into its PromQL pair.
 func Resolve(spec *symbiontv1alpha1.ShadowWorkloadSpec) (Queries, error) {
 	switch spec.Source.Type {
@@ -182,8 +191,9 @@ func resolveHostCgroup(path string, glob bool, job, instance, window string) (Qu
 	}
 	matchers := "{" + labelMatchers + "," + idMatcher + "}"
 	return Queries{
-		CPUCores:    fmt.Sprintf("sum(rate(container_cpu_usage_seconds_total%s[%s]))", matchers, window),
-		MemoryBytes: fmt.Sprintf("sum(avg_over_time(container_memory_working_set_bytes%s[%s]))", matchers, window),
+		CPUCores:     fmt.Sprintf("sum(rate(container_cpu_usage_seconds_total%s[%s]))", matchers, window),
+		MemoryBytes:  fmt.Sprintf("sum(avg_over_time(container_memory_working_set_bytes%s[%s]))", matchers, window),
+		TargetHealth: targetHealthQuery(job, instance),
 	}, nil
 }
 
@@ -205,8 +215,13 @@ func resolveDocker(docker *symbiontv1alpha1.DockerSource, window string) (Querie
 		// Counters need rate() first, then sum across containers.
 		CPUCores: fmt.Sprintf("sum(rate(container_cpu_usage_seconds_total%s[%s]))", matchers, window),
 		// Working set is a gauge and what eviction watches; smooth with avg_over_time.
-		MemoryBytes: fmt.Sprintf("sum(avg_over_time(container_memory_working_set_bytes%s[%s]))", matchers, window),
+		MemoryBytes:  fmt.Sprintf("sum(avg_over_time(container_memory_working_set_bytes%s[%s]))", matchers, window),
+		TargetHealth: targetHealthQuery(job, docker.CadvisorInstance),
 	}, nil
+}
+
+func targetHealthQuery(job, instance string) string {
+	return fmt.Sprintf("up{job=%s,instance=%s}", promLabel(job), promLabel(instance))
 }
 
 // promLabel renders a Prometheus label value literal, escaping backslashes
@@ -326,9 +341,11 @@ func (c *Client) Query(ctx context.Context, expr string) (float64, bool, error) 
 }
 
 // QueryPair resolves both halves of a Queries pair in sequence. Both resource
-// dimensions must have the same presence state: a fully absent pair means the
-// workload is off, while a partial pair is unsafe because zeroing only one side
-// could shrink that reservation below real usage.
+// dimensions must have the same presence state. Raw PromQL keeps the historic
+// contract that a fully absent pair means the workload is off. Typed cAdvisor
+// sources add TargetHealth; for those, a fully absent pair is accepted as
+// genuinely stopped only when the exact pinned target returns one `up == 1`
+// sample. Any missing, down, ambiguous, or failed health result fails closed.
 func (c *Client) QueryPair(ctx context.Context, q Queries) (cpuCores, memoryBytes float64, found bool, err error) {
 	cpu, cpuFound, err := c.Query(ctx, q.CPUCores)
 	if err != nil {
@@ -342,6 +359,13 @@ func (c *Client) QueryPair(ctx context.Context, q Queries) (cpuCores, memoryByte
 		return 0, 0, false, fmt.Errorf("%w: cpu present=%t memory present=%t", ErrPartialSample, cpuFound, memFound)
 	}
 	if !cpuFound {
+		if q.TargetHealth == "" {
+			return 0, 0, false, nil
+		}
+		health, healthFound, healthErr := c.Query(ctx, q.TargetHealth)
+		if healthErr != nil || !healthFound || health != 1 {
+			return 0, 0, false, ErrTargetUnavailable
+		}
 		return 0, 0, false, nil
 	}
 	if !validCPUResourceSample(cpu) || !validMemoryResourceSample(mem) {

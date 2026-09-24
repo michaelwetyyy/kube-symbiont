@@ -36,6 +36,7 @@ const (
 	testLabCadvisorInstance = "192.168.1.124:4194"
 	testCgroupGlob          = "/system.slice/worker-*.scope"
 	testSystemdUnit         = "minecraft.service"
+	testCadvisorHealthQuery = `up{job="cadvisor",instance="192.0.2.10:4194"}`
 )
 
 func dockerSpec(job, instance string) *symbiontv1alpha1.ShadowWorkloadSpec {
@@ -65,6 +66,9 @@ func TestResolveDockerGeneratesIDPrefixSelectors(t *testing.T) {
 	if q.MemoryBytes != wantMem {
 		t.Errorf("mem query:\n got %s\nwant %s", q.MemoryBytes, wantMem)
 	}
+	if q.TargetHealth != testCadvisorHealthQuery {
+		t.Errorf("health query:\n got %s\nwant %s", q.TargetHealth, testCadvisorHealthQuery)
+	}
 }
 
 func TestResolveDockerDefaultsJobAndRequiresInstance(t *testing.T) {
@@ -77,6 +81,9 @@ func TestResolveDockerDefaultsJobAndRequiresInstance(t *testing.T) {
 	}
 	if !strings.Contains(q.CPUCores, "[5m]") || !strings.Contains(q.MemoryBytes, "[5m]") {
 		t.Errorf("window not injected: %s | %s", q.CPUCores, q.MemoryBytes)
+	}
+	if q.TargetHealth != testCadvisorHealthQuery {
+		t.Errorf("default target health query missing: %s", q.TargetHealth)
 	}
 	if _, err := Resolve(dockerSpec("cadvisor", "")); err == nil {
 		t.Fatal("omitted instance must be rejected to prevent cross-node aggregation")
@@ -110,6 +117,9 @@ func TestResolvePromQLPassthrough(t *testing.T) {
 	}
 	if q.CPUCores != spec.Source.PromQL.CPUCores || q.MemoryBytes != spec.Source.PromQL.MemoryBytes {
 		t.Fatalf("passthrough mutated queries: %+v", q)
+	}
+	if q.TargetHealth != "" {
+		t.Fatalf("raw PromQL must not gain an inferred target-health contract: %q", q.TargetHealth)
 	}
 }
 
@@ -268,6 +278,106 @@ func TestQueryPairAllowsFullyAbsentPair(t *testing.T) {
 	}
 }
 
+func TestQueryPairTypedAbsentPairRequiresHealthyTarget(t *testing.T) {
+	tests := []struct {
+		name       string
+		healthBody string
+		healthCode int
+		wantOK     bool
+	}{
+		{
+			name:       "healthy exact target permits stopped workload",
+			healthBody: `{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"1"]}]}}`,
+			wantOK:     true,
+		},
+		{
+			name:       "down target fails closed",
+			healthBody: `{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"0"]}]}}`,
+		},
+		{
+			name:       "absent target fails closed",
+			healthBody: `{"status":"success","data":{"resultType":"vector","result":[]}}`,
+		},
+		{
+			name:       "ambiguous target fails closed",
+			healthBody: `{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"1"]},{"value":[0,"1"]}]}}`,
+		},
+		{
+			name:       "unexpected health value fails closed",
+			healthBody: `{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"2"]}]}}`,
+		},
+		{
+			name:       "health backend failure fails closed",
+			healthCode: http.StatusServiceUnavailable,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			healthQueries := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Query().Get("query") {
+				case testCPUQuery, testMemoryQuery:
+					_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+				case testCadvisorHealthQuery:
+					healthQueries++
+					if tt.healthCode != 0 {
+						http.Error(w, "target unavailable", tt.healthCode)
+						return
+					}
+					_, _ = w.Write([]byte(tt.healthBody))
+				default:
+					t.Errorf("unexpected query %q", r.URL.Query().Get("query"))
+				}
+			}))
+			defer srv.Close()
+			c, _ := NewClient(srv.URL, 0)
+			cpu, mem, found, err := c.QueryPair(context.Background(), Queries{
+				CPUCores: testCPUQuery, MemoryBytes: testMemoryQuery, TargetHealth: testCadvisorHealthQuery,
+			})
+			if healthQueries != 1 {
+				t.Fatalf("health query count = %d, want exactly 1", healthQueries)
+			}
+			if tt.wantOK {
+				if err != nil || cpu != 0 || mem != 0 || found {
+					t.Fatalf("healthy empty pair = (%v,%v,%v,%v), want 0/0/false/nil", cpu, mem, found, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrTargetUnavailable) {
+				t.Fatalf("error = %v, want ErrTargetUnavailable", err)
+			}
+		})
+	}
+}
+
+func TestQueryPairSkipsTargetHealthWhenResourcePairIsPresent(t *testing.T) {
+	healthQueried := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("query") {
+		case testCPUQuery:
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"2"]}]}}`))
+		case testMemoryQuery:
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"4096"]}]}}`))
+		case testCadvisorHealthQuery:
+			healthQueried = true
+			t.Error("target health must not be queried when the resource pair is present")
+		default:
+			t.Errorf("unexpected query %q", r.URL.Query().Get("query"))
+		}
+	}))
+	defer srv.Close()
+	c, _ := NewClient(srv.URL, 0)
+	cpu, mem, found, err := c.QueryPair(context.Background(), Queries{
+		CPUCores: testCPUQuery, MemoryBytes: testMemoryQuery, TargetHealth: testCadvisorHealthQuery,
+	})
+	if err != nil || cpu != 2 || mem != 4096 || !found {
+		t.Fatalf("complete pair = (%v,%v,%v,%v), want 2/4096/true/nil", cpu, mem, found, err)
+	}
+	if healthQueried {
+		t.Fatal("target health was queried for a complete pair")
+	}
+}
+
 func TestQueryPairRejectsPartialPair(t *testing.T) {
 	for _, missing := range []string{testCPUQuery, testMemoryQuery} {
 		t.Run("missing "+missing, func(t *testing.T) {
@@ -412,6 +522,10 @@ func TestResolveSystemdGeneratesExactCgroupSelector(t *testing.T) {
 	if !strings.Contains(q.CPUCores, want) || !strings.Contains(q.MemoryBytes, want) {
 		t.Fatalf("systemd matcher missing: %+v", q)
 	}
+	wantHealth := `up{job="` + testCadvisorHostJob + `",instance="` + testLabCadvisorInstance + `"}`
+	if q.TargetHealth != wantHealth {
+		t.Fatalf("systemd target health = %q, want %q", q.TargetHealth, wantHealth)
+	}
 }
 
 func TestResolveCgroupGlobIsAnchoredAndEscaped(t *testing.T) {
@@ -431,6 +545,9 @@ func TestResolveCgroupGlobIsAnchoredAndEscaped(t *testing.T) {
 	}
 	if !strings.Contains(q.CPUCores, `job="cadvisor"`) || !strings.Contains(q.CPUCores, `[2m]`) {
 		t.Fatalf("defaults/window missing: %s", q.CPUCores)
+	}
+	if q.TargetHealth != testCadvisorHealthQuery {
+		t.Fatalf("cgroup target health missing: %s", q.TargetHealth)
 	}
 }
 

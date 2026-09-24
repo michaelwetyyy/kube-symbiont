@@ -231,6 +231,27 @@ var _ = Describe("ShadowWorkload Metrics", func() {
 		Expect(multiSample).To(BeFalse())
 	})
 
+	It("should classify pinned-target loss as target_unavailable and keep last measurement telemetry", func() {
+		reconcileOnce()
+		before := gatherSeries(metricRegistry)
+		stampBefore, _ := before.one(famLastSuccess, seriesLabels)
+		measuredBefore, _ := before.one(famMeasuredCPU, seriesLabels)
+
+		metricsStub.err = sources.ErrTargetUnavailable
+		reconcileOnce()
+
+		g := gatherSeries(metricRegistry)
+		failures, ok := g.one(famFailures, failureLabels(metrics.FailureTargetUnavailable))
+		Expect(ok).To(BeTrue())
+		Expect(failures).To(Equal(1.0))
+		stampAfter, _ := g.one(famLastSuccess, seriesLabels)
+		Expect(stampAfter).To(Equal(stampBefore), "target-health failures must not refresh success time")
+		measuredAfter, _ := g.one(famMeasuredCPU, seriesLabels)
+		Expect(measuredAfter).To(Equal(measuredBefore), "target-health failures keep the last measured footprint")
+		_, generic := g.one(famFailures, failureLabels(metrics.FailurePrometheusUnavailable))
+		Expect(generic).To(BeFalse(), "target loss has its own bounded reason")
+	})
+
 	It("should classify multi-sample replies via the bounded enum", func() {
 		metricsStub.err = fmt.Errorf("cpu query: %w", sources.ErrMultiSample)
 		reconcileOnce()
@@ -318,6 +339,7 @@ var _ = Describe("ShadowWorkload Metrics", func() {
 						allowedReasons := map[string]struct{}{
 							string(metrics.FailurePrometheusUnavailable): {},
 							string(metrics.FailureMultiSample):           {},
+							string(metrics.FailureTargetUnavailable):     {},
 							string(metrics.FailureResizeRejected):        {},
 							string(metrics.FailureSourceMissing):         {},
 						}
