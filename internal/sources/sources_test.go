@@ -289,9 +289,9 @@ func TestQueryPairRejectsPartialPair(t *testing.T) {
 }
 
 func TestResourceSampleBoundsAvoidQuantitySaturation(t *testing.T) {
-	cpuEdge := float64(math.MaxInt64) / 1000
+	cpuEdge := float64(math.MaxInt64) / 1_000_000_000
 	if validCPUResourceSample(cpuEdge) {
-		t.Fatalf("CPU edge %.17g must be rejected because millicore conversion can saturate int64", cpuEdge)
+		t.Fatalf("CPU edge %.17g must be rejected because nanocore status conversion can saturate int64", cpuEdge)
 	}
 	if safe := math.Nextafter(cpuEdge, 0); !validCPUResourceSample(safe) {
 		t.Fatalf("next CPU float below overflow edge %.17g should remain representable", safe)

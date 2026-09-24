@@ -142,6 +142,23 @@ func TestPairOf(t *testing.T) {
 	}
 }
 
+func TestMeasurementPairOfPreservesSubMillicoreCPU(t *testing.T) {
+	p := MeasurementPairOf(0.0000898010608132978, 3088384)
+	if p.CPU.String() != "89801n" {
+		t.Fatalf("CPU = %s, want 89801n", p.CPU.String())
+	}
+	if p.Memory.Value() != 3088384 {
+		t.Fatalf("Memory = %d, want 3088384 bytes", p.Memory.Value())
+	}
+
+	// Scheduler conversion intentionally remains coarser to avoid resize
+	// flapping; status precision must not change reservation semantics.
+	scheduler := PairOf(0.0000898010608132978, 3088384)
+	if !scheduler.CPU.IsZero() {
+		t.Fatalf("scheduler CPU = %s, want whole-millicore rounding to zero", scheduler.CPU.String())
+	}
+}
+
 func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	sch := runtime.NewScheme()
