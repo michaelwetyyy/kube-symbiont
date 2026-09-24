@@ -151,7 +151,7 @@ def verify_stable_promotion_workflow(text: str, path: pathlib.Path) -> None:
         'test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"',
         "refs/remotes/origin/main",
         "Verify the tested candidate digest",
-        'candidate_ref="${IMAGE}:${CANDIDATE_TAG#v}"',
+        'candidate_ref="${IMAGE}:${CANDIDATE_TAG}"',
         'test "$candidate_digest" = "$EXPECTED_DIGEST"',
         "Promote exact candidate digest to stable image tags",
         '--tag "$immutable_tag"',
