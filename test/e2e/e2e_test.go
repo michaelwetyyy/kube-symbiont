@@ -20,7 +20,9 @@ limitations under the License.
 package e2e
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -34,8 +36,9 @@ import (
 // namespace where the project is deployed in
 const namespace = "kube-symbiont-system"
 
-// serviceAccountName created for the project
-const serviceAccountName = "kube-symbiont-controller-manager"
+// metricsProbeServiceAccountName is a least-privilege identity used only by
+// the E2E metrics probe. It must not borrow the controller manager's RBAC.
+const metricsProbeServiceAccountName = "kube-symbiont-metrics-probe"
 
 // metricsServiceName is the name of the metrics service of the project
 const metricsServiceName = "kube-symbiont-controller-manager-metrics-service"
@@ -43,34 +46,64 @@ const metricsServiceName = "kube-symbiont-controller-manager-metrics-service"
 // metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
 const metricsRoleBindingName = "kube-symbiont-metrics-binding"
 
+// e2eInstallerPath is deliberately outside dist/ so E2E image substitution
+// can never dirty the tracked release installer.
+const e2eInstallerPath = "bin/e2e-install.yaml"
+
+func upgradeShadowWorkloadManifest(namespace, sourceType string) string {
+	source := `type: promql
+    promql:
+      cpuCores: vector(0.1)
+      memoryBytes: vector(33554432)`
+	if sourceType == "systemd" {
+		source = `type: systemd
+    systemd:
+      unit: minecraft.service
+      cadvisorJob: cadvisor-host
+      cadvisorInstance: 192.0.2.10:4194`
+	}
+	return fmt.Sprintf(`
+apiVersion: symbiont.tensorhost.com/v1alpha1
+kind: ShadowWorkload
+metadata:
+  name: upgrade-shadow
+  namespace: %s
+spec:
+  node: kind-control-plane
+  source:
+    %s
+  metrics:
+    prometheusURL: http://prometheus.invalid:9090
+    window: 5m
+  update:
+    deltaThresholdPercent: 10
+    pollInterval: 30s
+    floor: {cpu: 10m, memory: 32Mi}
+    ceiling: {cpu: "1", memory: 1Gi}
+`, namespace, source)
+}
+
 var _ = Describe("Manager", Ordered, func() {
 	var controllerPodName string
 
-	// Before running the tests, generate and apply the same consolidated file
-	// shipped on releases. Starting from an empty Kind cluster prevents e2e
-	// setup from masking a missing Namespace, PriorityClass, CRD or RBAC object.
+	// Generate the same consolidated file shipped on releases. Installation is
+	// deliberately deferred until after the upgrade-ordering test so the suite
+	// begins from a legacy CRD rather than masking schema transition failures.
 	BeforeAll(func() {
 		By("generating the self-contained installer")
-		cmd := exec.Command("make", "build-installer", fmt.Sprintf("IMG=%s", managerImage))
+		cmd := exec.Command("make", "build-installer", fmt.Sprintf("IMG=%s", managerImage), fmt.Sprintf("INSTALLER=%s", e2eInstallerPath))
 		_, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to generate the installer")
-
-		By("installing every prerequisite and the manager from one manifest")
-		cmd = exec.Command("kubectl", "apply", "-f", "dist/install.yaml")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to apply the installer")
-
-		By("labeling the deployed namespace to enforce the restricted security policy")
-		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
-			"pod-security.kubernetes.io/enforce=restricted")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
 	})
 
 	// After all tests have been executed, delete the exact installed manifest.
 	AfterAll(func() {
-		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
+		By("cleaning up the curl pod and least-privilege metrics identity")
+		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+		cmd = exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+		cmd = exec.Command("kubectl", "delete", "serviceaccount", metricsProbeServiceAccountName, "-n", namespace, "--ignore-not-found")
 		_, _ = utils.Run(cmd)
 
 		By("cleaning up the reconciliation test resource")
@@ -78,8 +111,9 @@ var _ = Describe("Manager", Ordered, func() {
 		_, _ = utils.Run(cmd)
 
 		By("deleting the exact consolidated installer")
-		cmd = exec.Command("kubectl", "delete", "-f", "dist/install.yaml", "--ignore-not-found")
+		cmd = exec.Command("kubectl", "delete", "-f", e2eInstallerPath, "--ignore-not-found")
 		_, _ = utils.Run(cmd)
+		_ = os.Remove(e2eInstallerPath)
 	})
 
 	// After each test, check for failures and collect logs, events,
@@ -129,6 +163,108 @@ var _ = Describe("Manager", Ordered, func() {
 	SetDefaultEventuallyPollingInterval(time.Second)
 
 	Context("Manager", func() {
+		It("should require the new CRD schema before migrating a CR to a new source field", func() {
+			const upgradeNamespace = "kube-symbiont-upgrade-e2e"
+			const crdPath = "config/crd/bases/symbiont.tensorhost.com_shadowworkloads.yaml"
+
+			By("deriving a legacy docker/promql-only CRD from the current generated schema")
+			cmd := exec.Command("kubectl", "create", "--dry-run=client", "-f", crdPath, "-o", "json")
+			currentJSON, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			var legacy map[string]any
+			Expect(json.Unmarshal([]byte(currentJSON), &legacy)).To(Succeed())
+			spec := legacy["spec"].(map[string]any)
+			versions := spec["versions"].([]any)
+			version := versions[0].(map[string]any)
+			schema := version["schema"].(map[string]any)["openAPIV3Schema"].(map[string]any)
+			source := schema["properties"].(map[string]any)["spec"].(map[string]any)["properties"].(map[string]any)["source"].(map[string]any)
+			sourceProperties := source["properties"].(map[string]any)
+			delete(sourceProperties, "cgroup")
+			delete(sourceProperties, "systemd")
+			sourceProperties["type"].(map[string]any)["enum"] = []any{"docker", "promql"}
+			source["x-kubernetes-validations"] = []any{
+				map[string]any{
+					"message": "exactly one of source.docker or source.promql must be set",
+					"rule":    "[has(self.docker), has(self.promql)].filter(x, x).size() == 1",
+				},
+				map[string]any{
+					"message": "source.type must match the configured source block",
+					"rule":    "(self.type == 'docker') == has(self.docker)",
+				},
+			}
+			legacyJSON, err := json.MarshalIndent(legacy, "", "  ")
+			Expect(err).NotTo(HaveOccurred())
+			legacyFile, err := os.CreateTemp("", "kube-symbiont-legacy-crd-*.json")
+			Expect(err).NotTo(HaveOccurred())
+			legacyPath := legacyFile.Name()
+			DeferCleanup(func() { _ = os.Remove(legacyPath) })
+			_, err = legacyFile.Write(append(legacyJSON, '\n'))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(legacyFile.Close()).To(Succeed())
+
+			cmd = exec.Command("kubectl", "apply", "-f", legacyPath)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			cmd = exec.Command("kubectl", "wait", "--for=condition=Established", "crd/shadowworkloads.symbiont.tensorhost.com", "--timeout=60s")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("creating a legacy PromQL CR")
+			cmd = exec.Command("kubectl", "create", "namespace", upgradeNamespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() {
+				cleanup := exec.Command("kubectl", "delete", "namespace", upgradeNamespace, "--ignore-not-found", "--wait=false")
+				_, _ = utils.Run(cleanup)
+			})
+			legacyCR := upgradeShadowWorkloadManifest(upgradeNamespace, "promql")
+			cmd = exec.Command("kubectl", "apply", "--server-side", "--field-manager=symbiont-upgrade-e2e", "-f", "-")
+			cmd.Stdin = strings.NewReader(legacyCR)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("proving a CR using the new systemd field is rejected before the CRD upgrade")
+			typedCR := upgradeShadowWorkloadManifest(upgradeNamespace, "systemd")
+			cmd = exec.Command("kubectl", "apply", "--server-side", "--field-manager=symbiont-upgrade-e2e", "-f", "-")
+			cmd.Stdin = strings.NewReader(typedCR)
+			_, err = utils.Run(cmd)
+			Expect(err).To(HaveOccurred())
+
+			By("upgrading only the CRD and waiting for the API server to establish the new schema")
+			cmd = exec.Command("kubectl", "apply", "--server-side", "-f", crdPath)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			cmd = exec.Command("kubectl", "wait", "--for=condition=Established", "crd/shadowworkloads.symbiont.tensorhost.com", "--timeout=60s")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("migrating the existing CR to the typed systemd source after the schema is live")
+			cmd = exec.Command("kubectl", "apply", "--server-side", "--field-manager=symbiont-upgrade-e2e", "-f", "-")
+			cmd.Stdin = strings.NewReader(typedCR)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			cmd = exec.Command("kubectl", "get", "shadowworkload", "upgrade-shadow", "-n", upgradeNamespace,
+				"-o", "jsonpath={.spec.source.type}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(Equal("systemd"))
+		})
+
+		It("should install the current release from one self-contained manifest", func() {
+			By("installing every prerequisite and the manager from one manifest")
+			cmd := exec.Command("kubectl", "apply", "-f", e2eInstallerPath)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply the installer")
+
+			By("verifying the installer enforced Restricted Pod Security before workload admission")
+			cmd = exec.Command("kubectl", "get", "namespace", namespace,
+				"-o", "jsonpath={.metadata.labels.pod-security\\.kubernetes\\.io/enforce}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to read namespace Pod Security labels")
+			Expect(output).To(Equal("restricted"))
+		})
+
 		It("should run successfully", func() {
 			By("validating that the controller-manager pod is running as expected")
 			verifyControllerUp := func(g Gomega) {
@@ -226,13 +362,18 @@ spec:
 		})
 
 		It("should ensure the metrics endpoint is serving metrics", func() {
-			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=kube-symbiont-metrics-reader",
-				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
-			)
+			By("creating a dedicated least-privilege service account for the metrics probe")
+			cmd := exec.Command("kubectl", "create", "serviceaccount", metricsProbeServiceAccountName, "-n", namespace)
 			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
+			Expect(err).NotTo(HaveOccurred(), "Failed to create metrics probe ServiceAccount")
+
+			By("granting only the non-resource /metrics reader role to the probe")
+			cmd = exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
+				"--clusterrole=kube-symbiont-metrics-reader",
+				fmt.Sprintf("--serviceaccount=%s:%s", namespace, metricsProbeServiceAccountName),
+			)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create metrics probe ClusterRoleBinding")
 
 			By("validating that the metrics service is available")
 			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
@@ -264,13 +405,13 @@ spec:
 			By("creating the curl-metrics pod to access the metrics endpoint")
 			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
 				"--namespace", namespace,
-				"--image=curlimages/curl:latest",
+				"--image=curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6",
 				"--overrides",
 				fmt.Sprintf(`{
 					"spec": {
 						"containers": [{
 							"name": "curl",
-							"image": "curlimages/curl:latest",
+							"image": "curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6",
 							"command": ["/bin/sh", "-c"],
 							"args": [
 								"TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token); for i in $(seq 1 30); do curl -v -k -H \"Authorization: Bearer $TOKEN\" https://%s.%s.svc.cluster.local:8443/metrics && exit 0 || sleep 2; done; exit 1"
@@ -290,7 +431,7 @@ spec:
 						}],
 						"serviceAccountName": "%s"
 					}
-				}`, metricsServiceName, namespace, serviceAccountName))
+				}`, metricsServiceName, namespace, metricsProbeServiceAccountName))
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
 

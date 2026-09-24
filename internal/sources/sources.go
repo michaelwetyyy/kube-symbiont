@@ -42,6 +42,49 @@ type Queries struct {
 	MemoryBytes string
 }
 
+// Description is the durable, human-readable resolution of a source. It is
+// safe to surface in CR status and deliberately excludes generated PromQL.
+type Description struct {
+	Type             symbiontv1alpha1.SourceType
+	CgroupPath       string
+	CadvisorJob      string
+	CadvisorInstance string
+}
+
+// Describe returns the concrete host source selected by a validated source
+// declaration. Raw PromQL has no host-resolution metadata beyond its type.
+func Describe(spec *symbiontv1alpha1.ShadowWorkloadSpec) Description {
+	description := Description{Type: spec.Source.Type}
+	switch spec.Source.Type {
+	case symbiontv1alpha1.SourceTypeDocker:
+		if spec.Source.Docker != nil {
+			description.CadvisorJob = cadvisorJob(spec.Source.Docker.CadvisorJob)
+			description.CadvisorInstance = spec.Source.Docker.CadvisorInstance
+		}
+	case symbiontv1alpha1.SourceTypeCgroup:
+		if spec.Source.Cgroup != nil {
+			description.CgroupPath = spec.Source.Cgroup.Path
+			description.CadvisorJob = cadvisorJob(spec.Source.Cgroup.CadvisorJob)
+			description.CadvisorInstance = spec.Source.Cgroup.CadvisorInstance
+		}
+	case symbiontv1alpha1.SourceTypeSystemd:
+		if spec.Source.Systemd != nil {
+			description.CgroupPath = "/system.slice/" + spec.Source.Systemd.Unit
+			description.CadvisorJob = cadvisorJob(spec.Source.Systemd.CadvisorJob)
+			description.CadvisorInstance = spec.Source.Systemd.CadvisorInstance
+		}
+	case symbiontv1alpha1.SourceTypePromQL:
+	}
+	return description
+}
+
+func cadvisorJob(job string) string {
+	if job == "" {
+		return "cadvisor"
+	}
+	return job
+}
+
 // dockerCgroupIDSelector isolates bare-metal Docker containers from k8s pods.
 // Per the 2026-08-21 scheduling-gap study, image-label matching is refuted:
 // cAdvisor monitors the whole cgroup tree and k8s pod series carry image
@@ -127,9 +170,7 @@ func resolveHostCgroup(path string, glob bool, job, instance, window string) (Qu
 	if instance == "" {
 		return Queries{}, errors.New("host source requires cadvisorInstance for per-node accounting")
 	}
-	if job == "" {
-		job = "cadvisor"
-	}
+	job = cadvisorJob(job)
 	labelMatchers := fmt.Sprintf("job=%s,instance=%s", promLabel(job), promLabel(instance))
 	var idMatcher string
 	if glob {
@@ -152,9 +193,7 @@ func resolveDocker(docker *symbiontv1alpha1.DockerSource, window string) (Querie
 	}
 
 	job := docker.CadvisorJob
-	if job == "" {
-		job = "cadvisor"
-	}
+	job = cadvisorJob(job)
 	labelMatchers := fmt.Sprintf("job=%s", promLabel(job))
 	if docker.CadvisorInstance == "" {
 		return Queries{}, fmt.Errorf("docker source requires cadvisorInstance for per-node accounting")
@@ -319,6 +358,8 @@ func validCPUResourceSample(value float64) bool {
 }
 
 func validMemoryResourceSample(value float64) bool {
+	// float64(MaxInt64) rounds up to 2^63. Step down one representable float
+	// so NewQuantity's int64 input can never saturate.
 	maxInt64Float := math.Nextafter(float64(math.MaxInt64), 0)
 	return validFiniteNonNegative(value) && value <= maxInt64Float
 }

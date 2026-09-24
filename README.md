@@ -68,9 +68,32 @@ Exactly one source per ShadowWorkload; each resolves to a CPU-cores + memory-byt
 
 CPU and memory are treated as one accounting snapshot: both series may be absent together (the workload is off), but a partial pair or a negative/non-finite/unrepresentable value is rejected and the phantom keeps its last accepted reservation.
 
+
+### Operational status
+
+`status.currentCPU` / `status.currentMemory` are the scheduler reservation currently held by the
+phantom. `status.lastMeasurement` records the most recent successful raw CPU/memory observation,
+its timestamp, whether the source returned an actual series, and the `observedGeneration` whose
+source/metrics configuration produced it. `status.resolvedSource` records the concrete source that
+produced that same observation (including cgroup path and cAdvisor target for typed host sources).
+Measurement/source snapshots are retained during later backend failures; if a newer spec cannot be
+measured, `lastMeasurement.observedGeneration` intentionally remains behind `metadata.generation`
+while the `Ready` and `Degraded` conditions describe current health at the new generation.
+`kubectl get shadowworkloads` labels the two sides explicitly as `ReserveCPU`/`ReserveMem` and
+`MeasuredCPU`/`MeasuredMem`; `-o wide` also shows the phantom pod and last measurement time.
+
+### CRD upgrade ordering
+
+When a release adds source fields to the CRD, upgrade in two stages: apply the new CRD/controller
+and wait for the CRD to be `Established`, then migrate existing ShadowWorkloads to the new fields.
+Do not bundle a CR that already uses a new field into the same GitOps comparison against an older
+live CRD schema. For server-side apply, keep the same field manager across the old and migrated CR
+so omitted fields from the previous source block are pruned atomically. The Kind E2E suite exercises
+this legacy-schema → CRD upgrade → CR migration path.
+
 ## Quickstart
 
-Prerequisites: Go 1.26+ (go.mod declares go 1.26.0), kubectl, kustomize (Makefile fetches tools locally), and a cluster
+Prerequisites: Go 1.26.7+ (go.mod declares go 1.26.7), kubectl, kustomize (Makefile fetches tools locally), and a cluster
 running Kubernetes ≥ 1.29 with Prometheus already scraping cAdvisor.
 
 ```sh

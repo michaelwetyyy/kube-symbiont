@@ -1,4 +1,7 @@
 {{- if .Values.networkPolicy.enabled }}
+{{- if and .Values.prometheus.enabled (empty .Values.prometheus.scraperServiceAccount.namespace) }}
+{{- fail "prometheus.enabled=true with networkPolicy.enabled=true requires prometheus.scraperServiceAccount.namespace so the scraper namespace can be admitted" }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -16,9 +19,19 @@ spec:
     - Ingress
   ingress:
     - from:
+      # Explicit opt-in path for additional scrapers or diagnostic clients.
       - namespaceSelector:
           matchLabels:
             metrics: enabled
+      {{- if .Values.prometheus.enabled }}
+      # Keep prometheus.enabled + networkPolicy.enabled self-consistent: the
+      # configured scraper namespace is admitted without requiring a second,
+      # undocumented namespace label. Kubernetes adds this well-known label
+      # to every namespace.
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: {{ .Values.prometheus.scraperServiceAccount.namespace | quote }}
+      {{- end }}
       ports:
         - port: {{ .Values.metrics.port }}
           protocol: TCP

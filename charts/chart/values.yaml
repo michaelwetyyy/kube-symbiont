@@ -198,4 +198,7 @@ prometheus:
 ## Enable to restrict ingress to the controller manager.
 ##
 networkPolicy:
+  ## Restrict manager ingress. Namespaces labeled `metrics=enabled` are
+  ## admitted; when prometheus.enabled=true, the configured Prometheus scraper
+  ## namespace is also admitted automatically.
   enabled: false

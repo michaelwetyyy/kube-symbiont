@@ -268,21 +268,22 @@ func (r *ShadowWorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if degradedReason != "" {
 		meta.SetStatusCondition(&sw.Status.Conditions, metav1.Condition{
 			Type: conditionReady, Status: metav1.ConditionFalse, Reason: degradedReason,
-			Message: degradedMsg,
+			ObservedGeneration: sw.Generation, Message: degradedMsg,
 		})
 		meta.SetStatusCondition(&sw.Status.Conditions, metav1.Condition{
 			Type: conditionDegraded, Status: metav1.ConditionTrue, Reason: degradedReason,
-			Message: degradedMsg,
+			ObservedGeneration: sw.Generation, Message: degradedMsg,
 		})
 	} else {
 		meta.SetStatusCondition(&sw.Status.Conditions, metav1.Condition{
 			Type: conditionReady, Status: metav1.ConditionTrue, Reason: readyReason,
+			ObservedGeneration: sw.Generation,
 			Message: fmt.Sprintf("tracking node %q at cpu=%s memory=%s",
 				sw.Spec.Node, sw.Status.CurrentCPU.String(), sw.Status.CurrentMemory.String()),
 		})
 		meta.SetStatusCondition(&sw.Status.Conditions, metav1.Condition{
 			Type: conditionDegraded, Status: metav1.ConditionFalse, Reason: reasonAsExpected,
-			Message: "phantom tracking nominal",
+			ObservedGeneration: sw.Generation, Message: "phantom tracking nominal",
 		})
 	}
 
@@ -313,6 +314,7 @@ func (r *ShadowWorkloadReconciler) measure(
 		setDegraded(reasonSourceInvalid, "source configuration is invalid")
 		return
 	}
+	description := sources.Describe(&sw.Spec)
 	querier, err := r.QuerierFor(sw.Spec.Metrics.PrometheusURL)
 	if err != nil {
 		r.Metrics.MeasurementFailed(sw.Namespace, sw.Name, metrics.FailureSourceMissing)
@@ -343,7 +345,25 @@ func (r *ShadowWorkloadReconciler) measure(
 		return
 	}
 	r.Metrics.ObservedMeasurement(sw.Namespace, sw.Name, cpu, mem)
-	r.Metrics.MeasurementSucceeded(sw.Namespace, sw.Name, time.Now())
+	now := time.Now()
+	r.Metrics.MeasurementSucceeded(sw.Namespace, sw.Name, now)
+	measured := shadow.PairOf(cpu, mem)
+	// Advance the measurement and its source description together. If a later
+	// source/backend failure occurs, both remain a coherent last-known-good
+	// snapshot while Conditions describe the current failure.
+	sw.Status.LastMeasurement = &symbiontv1alpha1.MeasurementStatus{
+		ObservedGeneration: sw.Generation,
+		Time:               metav1.NewTime(now),
+		CPU:                measured.CPU,
+		Memory:             measured.Memory,
+		SeriesFound:        found,
+	}
+	sw.Status.ResolvedSource = &symbiontv1alpha1.ResolvedSourceStatus{
+		Type:             description.Type,
+		CgroupPath:       description.CgroupPath,
+		CadvisorJob:      description.CadvisorJob,
+		CadvisorInstance: description.CadvisorInstance,
+	}
 	// Per-poll telemetry lives in the kube_symbiont_* metrics series; keep
 	// the verbose log for debugging only so a 30-second poll does not emit
 	// thousands of identical lines per day.

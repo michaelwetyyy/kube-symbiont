@@ -250,6 +250,47 @@ type UpdatePolicy struct {
 	Ceiling ResourcePair `json:"ceiling"`
 }
 
+// MeasurementStatus records the last successful raw source measurement.
+// It is intentionally preserved across backend outages so status remains a
+// durable last-known-good observation instead of collapsing to zero.
+type MeasurementStatus struct {
+	// observedGeneration is the ShadowWorkload generation whose source and
+	// metrics configuration produced this measurement. It may intentionally
+	// lag metadata.generation while a newly edited spec is degraded.
+	ObservedGeneration int64 `json:"observedGeneration"`
+
+	// time is when the measurement completed successfully.
+	Time metav1.Time `json:"time"`
+
+	// cpu is the raw measured CPU footprint before floor/ceiling clamping.
+	CPU resource.Quantity `json:"cpu"`
+
+	// memory is the raw measured memory footprint before floor/ceiling clamping.
+	Memory resource.Quantity `json:"memory"`
+
+	// seriesFound distinguishes a real zero-valued sample from an empty query
+	// result (for example, a stopped service with no current cAdvisor series).
+	SeriesFound bool `json:"seriesFound"`
+}
+
+// ResolvedSourceStatus exposes the concrete source that produced the durable
+// lastMeasurement snapshot without leaking generated PromQL into status.
+type ResolvedSourceStatus struct {
+	Type SourceType `json:"type"`
+
+	// cgroupPath is populated for typed cgroup/systemd sources.
+	// +optional
+	CgroupPath string `json:"cgroupPath,omitempty"`
+
+	// cadvisorJob is populated for host sources backed by standalone cAdvisor.
+	// +optional
+	CadvisorJob string `json:"cadvisorJob,omitempty"`
+
+	// cadvisorInstance is the exact host scrape target used for accounting.
+	// +optional
+	CadvisorInstance string `json:"cadvisorInstance,omitempty"`
+}
+
 // ShadowWorkloadStatus defines the observed state of ShadowWorkload.
 type ShadowWorkloadStatus struct {
 	// phantomPod is the name of the ballast pod maintained on spec.node, if
@@ -269,6 +310,17 @@ type ShadowWorkloadStatus struct {
 	// +optional
 	LastResize metav1.Time `json:"lastResize,omitempty"`
 
+	// lastMeasurement is the most recent successful raw source measurement.
+	// It is retained during subsequent source/backend failures.
+	// +optional
+	LastMeasurement *MeasurementStatus `json:"lastMeasurement,omitempty"`
+
+	// resolvedSource describes the concrete source that produced
+	// lastMeasurement. It advances atomically with lastMeasurement and is
+	// retained with that last-known-good snapshot during later failures.
+	// +optional
+	ResolvedSource *ResolvedSourceStatus `json:"resolvedSource,omitempty"`
+
 	// conditions represent observations of the phantom lifecycle. Known types:
 	// Ready (phantom exists and tracks measurements), Degraded (node missing,
 	// Prometheus unreachable, resize rejected, PriorityClass absent).
@@ -283,10 +335,13 @@ type ShadowWorkloadStatus struct {
 // +kubebuilder:resource:scope=Namespaced,shortName=sw
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=".spec.node"
 // +kubebuilder:printcolumn:name="Source",type=string,JSONPath=".spec.source.type"
-// +kubebuilder:printcolumn:name="Phantom",type=string,JSONPath=".status.phantomPod"
-// +kubebuilder:printcolumn:name="CPU",type=string,JSONPath=".status.currentCPU"
-// +kubebuilder:printcolumn:name="Memory",type=string,JSONPath=".status.currentMemory"
+// +kubebuilder:printcolumn:name="ReserveCPU",type=string,JSONPath=".status.currentCPU"
+// +kubebuilder:printcolumn:name="ReserveMem",type=string,JSONPath=".status.currentMemory"
+// +kubebuilder:printcolumn:name="MeasuredCPU",type=string,JSONPath=".status.lastMeasurement.cpu"
+// +kubebuilder:printcolumn:name="MeasuredMem",type=string,JSONPath=".status.lastMeasurement.memory"
 // +kubebuilder:printcolumn:name="Ready",type="string",JSONPath=".status.conditions[?(@.type=='Ready')].status"
+// +kubebuilder:printcolumn:name="Phantom",type=string,JSONPath=".status.phantomPod",priority=1
+// +kubebuilder:printcolumn:name="MeasuredAt",type="date",JSONPath=".status.lastMeasurement.time",priority=1
 
 // ShadowWorkload maintains a phantom ("ballast") pod whose resource requests
 // mirror the real footprint of a bare-metal workload, making that footprint

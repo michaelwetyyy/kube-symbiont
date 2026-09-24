@@ -171,6 +171,46 @@ def validate_helm() -> None:
     if "changes(" in rendered:
         fail("rendered Helm rules use changes() on a counter")
 
+    require_failure(
+        "prometheus.enabled=true with networkPolicy.enabled=true requires prometheus.scraperServiceAccount.namespace",
+        "helm",
+        "template",
+        "invalid-network-policy",
+        "charts/chart",
+        "--set",
+        "prometheus.enabled=true",
+        "--set",
+        "networkPolicy.enabled=true",
+        "--set",
+        "metrics.secure=false",
+    )
+
+    networked = run(
+        "helm",
+        "template",
+        "verify-monitoring-network-policy",
+        "charts/chart",
+        "--namespace",
+        "kube-symbiont-system",
+        "--set",
+        "prometheus.enabled=true",
+        "--set",
+        "networkPolicy.enabled=true",
+        "--set",
+        "metrics.tls.existingSecret=metrics-server-cert",
+        "--set",
+        "prometheus.scraperServiceAccount.name=kube-prometheus-stack-prometheus",
+        "--set",
+        "prometheus.scraperServiceAccount.namespace=monitoring",
+    )
+    for item in (
+        "kind: NetworkPolicy",
+        'kubernetes.io/metadata.name: "monitoring"',
+        "metrics: enabled",
+    ):
+        if item not in networked:
+            fail(f"Helm network policy render is missing {item}")
+
 
 def main() -> int:
     validate_dashboard()

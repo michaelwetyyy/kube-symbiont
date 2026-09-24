@@ -23,18 +23,29 @@ spec:
     - jsonPath: .spec.source.type
       name: Source
       type: string
-    - jsonPath: .status.phantomPod
-      name: Phantom
-      type: string
     - jsonPath: .status.currentCPU
-      name: CPU
+      name: ReserveCPU
       type: string
     - jsonPath: .status.currentMemory
-      name: Memory
+      name: ReserveMem
+      type: string
+    - jsonPath: .status.lastMeasurement.cpu
+      name: MeasuredCPU
+      type: string
+    - jsonPath: .status.lastMeasurement.memory
+      name: MeasuredMem
       type: string
     - jsonPath: .status.conditions[?(@.type=='Ready')].status
       name: Ready
       type: string
+    - jsonPath: .status.phantomPod
+      name: Phantom
+      priority: 1
+      type: string
+    - jsonPath: .status.lastMeasurement.time
+      name: MeasuredAt
+      priority: 1
+      type: date
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -404,6 +415,50 @@ spec:
                 description: currentMemory mirrors the phantom's current memory request.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
+              lastMeasurement:
+                description: |-
+                  lastMeasurement is the most recent successful raw source measurement.
+                  It is retained during subsequent source/backend failures.
+                properties:
+                  cpu:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: cpu is the raw measured CPU footprint before floor/ceiling
+                      clamping.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  memory:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: memory is the raw measured memory footprint before
+                      floor/ceiling clamping.
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  observedGeneration:
+                    description: |-
+                      observedGeneration is the ShadowWorkload generation whose source and
+                      metrics configuration produced this measurement. It may intentionally
+                      lag metadata.generation while a newly edited spec is degraded.
+                    format: int64
+                    type: integer
+                  seriesFound:
+                    description: |-
+                      seriesFound distinguishes a real zero-valued sample from an empty query
+                      result (for example, a stopped service with no current cAdvisor series).
+                    type: boolean
+                  time:
+                    description: time is when the measurement completed successfully.
+                    format: date-time
+                    type: string
+                required:
+                - cpu
+                - memory
+                - observedGeneration
+                - seriesFound
+                - time
+                type: object
               lastResize:
                 description: lastResize is the time of the most recent accepted in-place
                   resize.
@@ -414,6 +469,36 @@ spec:
                   phantomPod is the name of the ballast pod maintained on spec.node, if
                   any has been created yet.
                 type: string
+              resolvedSource:
+                description: |-
+                  resolvedSource describes the concrete source that produced
+                  lastMeasurement. It advances atomically with lastMeasurement and is
+                  retained with that last-known-good snapshot during later failures.
+                properties:
+                  cadvisorInstance:
+                    description: cadvisorInstance is the exact host scrape target
+                      used for accounting.
+                    type: string
+                  cadvisorJob:
+                    description: cadvisorJob is populated for host sources backed
+                      by standalone cAdvisor.
+                    type: string
+                  cgroupPath:
+                    description: cgroupPath is populated for typed cgroup/systemd
+                      sources.
+                    type: string
+                  type:
+                    description: SourceType selects which bare-metal source a ShadowWorkload
+                      measures.
+                    enum:
+                    - docker
+                    - promql
+                    - cgroup
+                    - systemd
+                    type: string
+                required:
+                - type
+                type: object
             type: object
         required:
         - spec
