@@ -96,7 +96,7 @@ jobs:
       - name: Verify the tested candidate digest
         shell: bash
         run: |
-          candidate_ref="${IMAGE}:${CANDIDATE_TAG#v}"
+          candidate_ref="${IMAGE}:${CANDIDATE_TAG}"
           candidate_digest="$(docker buildx imagetools inspect "$candidate_ref" | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"
           test "$candidate_digest" = "$EXPECTED_DIGEST"
 
