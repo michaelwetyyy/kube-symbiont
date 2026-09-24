@@ -58,8 +58,8 @@ spec:
         description: >
           A measurement or reservation-update failure occurred in the last
           ten minutes. The bounded reason label distinguishes backend
-          unavailability, multi-sample, partial or invalid measurements,
-          rejected resize and missing source configuration.
+          unavailability, pinned-target loss, multi-sample, partial or invalid
+          measurements, rejected resize and missing source configuration.
     - alert: KubeSymbiontReservationFlapping
       expr: increase(kube_symbiont_shadowworkload_reservation_updates_total[15m]) > 6
       for: 5m

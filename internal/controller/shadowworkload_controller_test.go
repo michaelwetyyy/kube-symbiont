@@ -499,6 +499,61 @@ var _ = Describe("ShadowWorkload Controller", func() {
 		Expect(degraded.Reason).To(Equal("ResizeRejected"))
 	})
 
+	It("should retain last truth when the pinned cAdvisor target disappears and recover", func() {
+		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		before := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, before)).To(Succeed())
+		Expect(before.Status.CurrentCPU.String()).To(Equal("2"))
+		Expect(before.Status.CurrentMemory.String()).To(Equal("6Gi"))
+		Expect(before.Status.LastMeasurement).NotTo(BeNil())
+		measurementTime := before.Status.LastMeasurement.Time
+		measurementCPU := before.Status.LastMeasurement.CPU.DeepCopy()
+		measurementMemory := before.Status.LastMeasurement.Memory.DeepCopy()
+		lastResize := before.Status.LastResize
+
+		By("failing closed when the exact cAdvisor target is no longer trustworthy")
+		stub.err = fmt.Errorf("target health: %w", sources.ErrTargetUnavailable)
+		stub.cpu, stub.mem = 0, 0
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		outage := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, outage)).To(Succeed())
+		Expect(outage.Status.CurrentCPU.String()).To(Equal("2"))
+		Expect(outage.Status.CurrentMemory.String()).To(Equal("6Gi"))
+		Expect(outage.Status.LastResize.Equal(&lastResize)).To(BeTrue())
+		Expect(outage.Status.LastMeasurement).NotTo(BeNil())
+		Expect(outage.Status.LastMeasurement.Time.Equal(&measurementTime)).To(BeTrue())
+		Expect(outage.Status.LastMeasurement.CPU.Cmp(measurementCPU)).To(Equal(0))
+		Expect(outage.Status.LastMeasurement.Memory.Cmp(measurementMemory)).To(Equal(0))
+		degraded := meta.FindStatusCondition(outage.Status.Conditions, conditionDegraded)
+		Expect(degraded).NotTo(BeNil())
+		Expect(degraded.Reason).To(Equal(reasonCadvisorTargetUnavailable))
+		Expect(degraded.Message).To(ContainSubstring("keeping the last accepted reservation"))
+
+		phantom := &corev1.Pod{}
+		phantomKey := types.NamespacedName{Name: "shadow-" + resourceName, Namespace: key.Namespace}
+		Expect(k8sClient.Get(ctx, phantomKey, phantom)).To(Succeed())
+		Expect(phantom.Spec.Containers[0].Resources.Requests.Cpu().String()).To(Equal("2"))
+		Expect(phantom.Spec.Containers[0].Resources.Requests.Memory().String()).To(Equal("6Gi"))
+
+		By("resuming measurement after the target recovers")
+		stub.err = nil
+		stub.cpu, stub.mem = 4, 12*1024*1024*1024
+		time.Sleep(1100 * time.Millisecond)
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		recovered := &symbiontv1alpha1.ShadowWorkload{}
+		Expect(k8sClient.Get(ctx, key, recovered)).To(Succeed())
+		Expect(recovered.Status.CurrentCPU.String()).To(Equal("4"))
+		Expect(recovered.Status.CurrentMemory.String()).To(Equal("12Gi"))
+		Expect(meta.IsStatusConditionFalse(recovered.Status.Conditions, conditionDegraded)).To(BeTrue())
+		Expect(recovered.Status.LastMeasurement.Time.After(measurementTime.Time)).To(BeTrue())
+	})
+
 	It("should retain last truth during a metrics outage and recover", func() {
 		Expect(k8sClient.Create(ctx, validShadowWorkload(resourceName))).To(Succeed())
 		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})

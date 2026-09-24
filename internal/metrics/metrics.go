@@ -70,6 +70,11 @@ const (
 	// FailureInvalidSample marks a negative, non-finite or unrepresentable sample.
 	FailureInvalidSample FailureReason = "invalid_sample"
 
+	// FailureTargetUnavailable marks a typed source whose exact pinned cAdvisor
+	// target is down, absent, ambiguous, or cannot be health-checked while the
+	// workload resource pair is absent. The controller preserves last truth.
+	FailureTargetUnavailable FailureReason = "target_unavailable"
+
 	// FailureResizeRejected marks an in-place resize rejected by the API
 	// server; the phantom keeps its last accepted requests.
 	FailureResizeRejected FailureReason = "resize_rejected"
@@ -85,6 +90,7 @@ var knownFailureReasons = map[FailureReason]struct{}{
 	FailureMultiSample:           {},
 	FailurePartialSample:         {},
 	FailureInvalidSample:         {},
+	FailureTargetUnavailable:     {},
 	FailureResizeRejected:        {},
 	FailureSourceMissing:         {},
 }

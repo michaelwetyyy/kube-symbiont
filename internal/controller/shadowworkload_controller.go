@@ -44,20 +44,21 @@ const (
 	conditionReady    = "Ready"
 	conditionDegraded = "Degraded"
 
-	reasonMetricsSynced         = "MetricsSynced"
-	reasonWithinThreshold       = "WithinThreshold"
-	reasonPhantomCreated        = "PhantomCreated"
-	reasonPhantomRecreating     = "PhantomRecreating"
-	reasonResized               = "Resized"
-	reasonNodeMissing           = "NodeMissing"
-	reasonNodeNotReady          = "NodeNotReady"
-	reasonNodeTerminating       = "NodeTerminating"
-	reasonSourceInvalid         = "SourceInvalid"
-	reasonPrometheusUnavailable = "PrometheusUnavailable"
-	reasonPriorityClassMissing  = "PriorityClassMissing"
-	reasonResizeRejected        = "ResizeRejected"
-	reasonPhantomConflict       = "PhantomConflict"
-	reasonAsExpected            = "AsExpected"
+	reasonMetricsSynced             = "MetricsSynced"
+	reasonWithinThreshold           = "WithinThreshold"
+	reasonPhantomCreated            = "PhantomCreated"
+	reasonPhantomRecreating         = "PhantomRecreating"
+	reasonResized                   = "Resized"
+	reasonNodeMissing               = "NodeMissing"
+	reasonNodeNotReady              = "NodeNotReady"
+	reasonNodeTerminating           = "NodeTerminating"
+	reasonSourceInvalid             = "SourceInvalid"
+	reasonPrometheusUnavailable     = "PrometheusUnavailable"
+	reasonCadvisorTargetUnavailable = "CadvisorTargetUnavailable"
+	reasonPriorityClassMissing      = "PriorityClassMissing"
+	reasonResizeRejected            = "ResizeRejected"
+	reasonPhantomConflict           = "PhantomConflict"
+	reasonAsExpected                = "AsExpected"
 
 	defaultPollInterval = 30 * time.Second
 	queryTimeout        = 10 * time.Second
@@ -325,23 +326,30 @@ func (r *ShadowWorkloadReconciler) measure(
 	defer cancel()
 	cpu, mem, found, qerr := querier.QueryPair(qctx, queries)
 	if qerr != nil {
-		reason := metrics.FailurePrometheusUnavailable
+		failureReason := metrics.FailurePrometheusUnavailable
+		conditionReason := reasonPrometheusUnavailable
+		conditionMessage := "metrics backend query failed"
+		eventMessage := "Metrics backend query failed (%s)"
 		switch {
+		case errors.Is(qerr, sources.ErrTargetUnavailable):
+			failureReason = metrics.FailureTargetUnavailable
+			conditionReason = reasonCadvisorTargetUnavailable
+			conditionMessage = "pinned cAdvisor target is unavailable; keeping the last accepted reservation"
+			eventMessage = "Pinned cAdvisor target unavailable (%s)"
 		case errors.Is(qerr, sources.ErrMultiSample):
-			reason = metrics.FailureMultiSample
+			failureReason = metrics.FailureMultiSample
 		case errors.Is(qerr, sources.ErrPartialSample):
-			reason = metrics.FailurePartialSample
+			failureReason = metrics.FailurePartialSample
 		case errors.Is(qerr, sources.ErrInvalidSample):
-			reason = metrics.FailureInvalidSample
+			failureReason = metrics.FailureInvalidSample
 		}
-		r.Metrics.MeasurementFailed(sw.Namespace, sw.Name, reason)
-		setDegraded(reasonPrometheusUnavailable, "metrics backend query failed")
+		r.Metrics.MeasurementFailed(sw.Namespace, sw.Name, failureReason)
+		setDegraded(conditionReason, "%s", conditionMessage)
 		// Backend-controlled errors can contain URLs, identifiers, reflected
 		// query text, or very large strings. Durable status, Events and logs use
 		// only the bounded classification.
-		log.Error(errors.New(string(reason)), "Failed to query metrics backend")
-		r.Recorder.Eventf(sw, corev1.EventTypeWarning, reasonPrometheusUnavailable,
-			"Metrics backend query failed (%s)", reason)
+		log.Error(errors.New(string(failureReason)), "Failed to query metrics backend")
+		r.Recorder.Eventf(sw, corev1.EventTypeWarning, conditionReason, eventMessage, failureReason)
 		return
 	}
 	r.Metrics.ObservedMeasurement(sw.Namespace, sw.Name, cpu, mem)
