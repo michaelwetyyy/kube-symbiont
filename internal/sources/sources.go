@@ -238,18 +238,13 @@ type Client struct {
 	http    *http.Client
 }
 
-// NewClient builds a client against a Prometheus base URL such as
-// http://kube-prometheus-stack-prometheus.monitoring:9090.
-func NewClient(rawURL string, timeout time.Duration) (*Client, error) {
-	parsed, err := url.Parse(strings.TrimRight(rawURL, "/"))
+// NewClient builds a client only after the operator-owned destination policy
+// accepts the workload-supplied URL. The policy check happens before any
+// transport is constructed or DNS resolution can occur.
+func NewClient(rawURL string, timeout time.Duration, policy DestinationPolicy) (*Client, error) {
+	parsed, err := policy.Validate(rawURL)
 	if err != nil {
-		return nil, errors.New("invalid prometheusURL")
-	}
-	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Opaque != "" {
-		return nil, errors.New("invalid prometheusURL: absolute http(s) URL with a host required")
-	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return nil, errors.New("invalid prometheusURL: credentials, query parameters and fragments are not allowed")
+		return nil, err
 	}
 	if timeout <= 0 {
 		timeout = 10 * time.Second
