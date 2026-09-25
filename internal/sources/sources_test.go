@@ -39,6 +39,14 @@ const (
 	testCadvisorHealthQuery = `up{job="cadvisor",instance="192.0.2.10:4194"}`
 )
 
+func testAllowAnyDestinationPolicy() DestinationPolicy {
+	policy, err := NewDestinationPolicy(nil, true)
+	if err != nil {
+		panic(err)
+	}
+	return policy
+}
+
 func dockerSpec(job, instance string) *symbiontv1alpha1.ShadowWorkloadSpec {
 	return &symbiontv1alpha1.ShadowWorkloadSpec{
 		Node: "lab",
@@ -221,7 +229,7 @@ func TestClientQuery(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			srv := httptest.NewServer(tt.handler)
 			defer srv.Close()
-			c, err := NewClient(srv.URL, 0)
+			c, err := NewClient(srv.URL, 0, testAllowAnyDestinationPolicy())
 			if err != nil {
 				t.Fatalf("NewClient: %v", err)
 			}
@@ -256,7 +264,7 @@ func TestQueryPairCombinesCompletePair(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	c, _ := NewClient(srv.URL, 0)
+	c, _ := NewClient(srv.URL, 0, testAllowAnyDestinationPolicy())
 	cpu, mem, found, err := c.QueryPair(context.Background(), Queries{CPUCores: testCPUQuery, MemoryBytes: testMemoryQuery})
 	if err != nil {
 		t.Fatalf("QueryPair: %v", err)
@@ -271,7 +279,7 @@ func TestQueryPairAllowsFullyAbsentPair(t *testing.T) {
 		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
 	}))
 	defer srv.Close()
-	c, _ := NewClient(srv.URL, 0)
+	c, _ := NewClient(srv.URL, 0, testAllowAnyDestinationPolicy())
 	cpu, mem, found, err := c.QueryPair(context.Background(), Queries{CPUCores: testCPUQuery, MemoryBytes: testMemoryQuery})
 	if err != nil || cpu != 0 || mem != 0 || found {
 		t.Fatalf("fully absent pair = (%v,%v,%v,%v), want 0/0/false/nil", cpu, mem, found, err)
@@ -330,7 +338,7 @@ func TestQueryPairTypedAbsentPairRequiresHealthyTarget(t *testing.T) {
 				}
 			}))
 			defer srv.Close()
-			c, _ := NewClient(srv.URL, 0)
+			c, _ := NewClient(srv.URL, 0, testAllowAnyDestinationPolicy())
 			cpu, mem, found, err := c.QueryPair(context.Background(), Queries{
 				CPUCores: testCPUQuery, MemoryBytes: testMemoryQuery, TargetHealth: testCadvisorHealthQuery,
 			})
@@ -366,7 +374,7 @@ func TestQueryPairSkipsTargetHealthWhenResourcePairIsPresent(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	c, _ := NewClient(srv.URL, 0)
+	c, _ := NewClient(srv.URL, 0, testAllowAnyDestinationPolicy())
 	cpu, mem, found, err := c.QueryPair(context.Background(), Queries{
 		CPUCores: testCPUQuery, MemoryBytes: testMemoryQuery, TargetHealth: testCadvisorHealthQuery,
 	})
@@ -389,7 +397,7 @@ func TestQueryPairRejectsPartialPair(t *testing.T) {
 				_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"1"]}]}}`))
 			}))
 			defer srv.Close()
-			c, _ := NewClient(srv.URL, 0)
+			c, _ := NewClient(srv.URL, 0, testAllowAnyDestinationPolicy())
 			_, _, _, err := c.QueryPair(context.Background(), Queries{CPUCores: testCPUQuery, MemoryBytes: testMemoryQuery})
 			if !errors.Is(err, ErrPartialSample) {
 				t.Fatalf("partial pair error = %v, want ErrPartialSample", err)
@@ -440,7 +448,7 @@ func TestQueryPairRejectsInvalidResourceValues(t *testing.T) {
 				_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"` + value + `"]}]}}`))
 			}))
 			defer srv.Close()
-			c, _ := NewClient(srv.URL, 0)
+			c, _ := NewClient(srv.URL, 0, testAllowAnyDestinationPolicy())
 			_, _, _, err := c.QueryPair(context.Background(), Queries{CPUCores: testCPUQuery, MemoryBytes: testMemoryQuery})
 			if !errors.Is(err, ErrInvalidSample) {
 				t.Fatalf("invalid pair error = %v, want ErrInvalidSample", err)
@@ -458,7 +466,7 @@ func TestNewClientValidation(t *testing.T) {
 		"http://prom:9090#fragment",
 	}
 	for _, rawURL := range bad {
-		if _, err := NewClient(rawURL, 0); err == nil {
+		if _, err := NewClient(rawURL, 0, testAllowAnyDestinationPolicy()); err == nil {
 			t.Errorf("NewClient(%q) should reject unsafe URL shape", rawURL)
 		}
 	}
@@ -475,7 +483,7 @@ func TestClientRejectsRedirectWithoutLeakingDestination(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c, err := NewClient(srv.URL, 0)
+	c, err := NewClient(srv.URL, 0, testAllowAnyDestinationPolicy())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -493,7 +501,7 @@ func TestMultiSampleClassifiesViaSentinel(t *testing.T) {
 		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"1"]},{"value":[0,"2"]}]}}`))
 	}))
 	defer srv.Close()
-	c, err := NewClient(srv.URL, 0)
+	c, err := NewClient(srv.URL, 0, testAllowAnyDestinationPolicy())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

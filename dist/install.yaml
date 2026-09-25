@@ -835,6 +835,7 @@ spec:
         - --metrics-bind-address=:8443
         - --leader-elect
         - --health-probe-bind-address=:8081
+        - --prometheus-allowed-destination=http://kube-prometheus-stack-prometheus.monitoring:9090
         command:
         - /manager
         image: ghcr.io/michaelwetyyy/kube-symbiont:0.1.0

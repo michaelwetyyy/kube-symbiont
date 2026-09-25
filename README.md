@@ -118,6 +118,24 @@ helm upgrade --install kube-symbiont ./charts/chart \
   --namespace kube-symbiont-system --create-namespace
 ```
 
+The manager, rather than each `ShadowWorkload`, owns the Prometheus egress
+boundary. The shipped manifests allow the example backend origin
+`http://kube-prometheus-stack-prometheus.monitoring:9090`. Declare every other
+backend explicitly with a repeated manager argument:
+
+```sh
+--prometheus-allowed-destination=https://prometheus.example:9090
+```
+
+For Helm, set `prometheusDestinationPolicy.allowedDestinations`. Rules are exact
+HTTP(S) origins: scheme, hostname and effective port must match; a URL path is
+permitted because it does not change the network destination. An empty list
+denies all destinations. Installations whose `ShadowWorkload` authors are fully
+trusted can deliberately restore unrestricted safe HTTP(S) destinations with
+`prometheusDestinationPolicy.allowAny=true` (or
+`--prometheus-allow-any-destination`), but allow-any cannot be combined with
+explicit rules.
+
 The manager always needs a minimal ClusterRole: ShadowWorkloads are namespaced,
 but their node-eligibility and ballast-priority gates read cluster-scoped Nodes
 and PriorityClasses. `rbac.namespaced` therefore scopes only the optional
@@ -220,11 +238,12 @@ make manifests generate   # regenerate CRDs/RBAC/deepcopy after API edits
 - **Trusted configuration boundary.** A `ShadowWorkload` author selects the Prometheus URL and,
   for raw `promql`, the query. Grant CR write access only to trusted operators; do not expose it
   as an untrusted multi-tenant API. Write access is effectively node-capacity-administrator access:
-  it can create or resize scheduler-visible reservations on a chosen node and select a network
-  destination reachable by the controller. The client rejects embedded credentials, URL query/fragment
-  data and redirects, bounds response size, and never persists backend response bodies or transport
-  destinations in status/events. It does not yet enforce an operator-level destination allowlist;
-  a trusted author can still select another directly reachable HTTP(S) host.
+  it can create or resize scheduler-visible reservations on a chosen node. The manager's exact-origin
+  allowlist prevents authors from selecting an undeclared network destination; the client also rejects
+  embedded credentials, URL query/fragment data and redirects, bounds response size, and never persists
+  backend response bodies or transport destinations in status/events. Host rules are checked before DNS
+  resolution, so use egress NetworkPolicy or an equivalent network control when DNS rebinding or allowed
+  destination compromise is in scope. `allowAny` deliberately restores the trusted-author behavior.
 - **Single-node targeting.** Each ShadowWorkload pins one node; multi-host bare metal means
   one resource per host.
 
