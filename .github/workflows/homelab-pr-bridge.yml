@@ -1,0 +1,176 @@
+name: Homelab PR Bridge
+
+on:
+  push:
+    branches:
+      - "automation/**"
+
+permissions: {}
+
+concurrency:
+  group: homelab-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Validate automation branch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      merge_requested: ${{ steps.meta.outputs.merge_requested }}
+    steps:
+      - name: Clone the exact branch source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Validate automation metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" == automation/* ]]
+          body="$(git log -1 --pretty=%B)"
+          if grep -Eq '^Automation-Merge:[[:space:]]*true[[:space:]]*$' <<<"$body"; then
+            echo 'merge_requested=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'merge_requested=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run repository gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+          python3 -B -m unittest hack/test_verify_release.py
+          make test
+          make lint-config
+          make lint
+          make verify-installer
+          helm lint charts/chart
+          python3 -B hack/verify-monitoring.py
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+  publish:
+    name: Create PR and honor merge request
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Clone the exact branch source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Create or find the pull request
+        id: pr
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          branch="$GITHUB_REF_NAME"
+          title="$(git log -1 --pretty=%s)"
+          pr="$(gh pr list --repo "$repo" --head "$branch" --base main --state open --json number --jq '.[0].number // empty')"
+          if [[ -z "$pr" ]]; then
+            body="Server-originated automation PR from \`$branch\`.\n\nHead: \`$GITHUB_SHA\`\n\nThe homelab branch passed the repository automation gate before this PR was opened."
+            url="$(gh pr create --repo "$repo" --base main --head "$branch" --title "$title" --body "$body")"
+            pr="${url##*/}"
+          fi
+          [[ "$pr" =~ ^[0-9]+$ ]]
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+          echo "PR #$pr"
+
+      - name: Wait for branch CI before merge
+        if: needs.gate.outputs.merge_requested == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          sha="$GITHUB_SHA"
+          required=("Tests" "Lint" "Test Chart" "E2E Tests")
+          for attempt in $(seq 1 80); do
+            runs="$(gh api "repos/$repo/actions/runs?head_sha=$sha&event=push&per_page=100")"
+            failed=0
+            pending=0
+            for workflow in "${required[@]}"; do
+              row="$(jq -c --arg workflow "$workflow" '[.workflow_runs[] | select(.name == $workflow)] | sort_by(.run_number) | last // empty' <<<"$runs")"
+              if [[ -z "$row" ]]; then
+                pending=1
+                echo "$workflow: not started yet"
+                continue
+              fi
+              status="$(jq -r '.status' <<<"$row")"
+              conclusion="$(jq -r '.conclusion // ""' <<<"$row")"
+              echo "$workflow: $status ${conclusion:-pending}"
+              if [[ "$status" == completed && "$conclusion" != success ]]; then
+                failed=1
+              elif [[ "$status" != completed ]]; then
+                pending=1
+              fi
+            done
+            if (( failed )); then
+              echo 'One or more required branch workflows failed.' >&2
+              exit 1
+            fi
+            if (( ! pending )); then
+              exit 0
+            fi
+            sleep 30
+          done
+          echo 'Timed out waiting for required branch workflows.' >&2
+          exit 1
+
+      - name: Revalidate the exact merge tree
+        if: needs.gate.outputs.merge_requested == 'true'
+        id: merge_tree
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          pr_json="$(gh api "repos/$repo/pulls/$PR_NUMBER")"
+          head_sha="$(jq -r '.head.sha' <<<"$pr_json")"
+          base_sha="$(jq -r '.base.sha' <<<"$pr_json")"
+          test "$head_sha" = "$GITHUB_SHA"
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          test "$(git rev-parse refs/remotes/origin/main)" = "$base_sha"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout --detach "$base_sha"
+          git merge --no-ff --no-commit "$head_sha"
+          tree="$(git write-tree)"
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+
+      - name: Merge the validated PR
+        if: needs.gate.outputs.merge_requested == 'true'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          EXPECTED_TREE: ${{ steps.merge_tree.outputs.tree }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          result="$(gh api --method PUT "repos/$repo/pulls/$PR_NUMBER/merge" -f sha="$GITHUB_SHA" -f merge_method=merge)"
+          test "$(jq -r '.merged' <<<"$result")" = true
+          merge_sha="$(jq -r '.sha' <<<"$result")"
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          test "$(git rev-parse refs/remotes/origin/main)" = "$merge_sha"
+          test "$(git rev-parse "$merge_sha^{tree}")" = "$EXPECTED_TREE"
+          git merge-base --is-ancestor "$GITHUB_SHA" "$merge_sha"
+          echo "Merged PR #$PR_NUMBER as $merge_sha with the exact validated tree."
