@@ -30,9 +30,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	symbiontv1alpha1 "github.com/michaelwetyyy/kube-symbiont/api/v1alpha1"
 	"github.com/michaelwetyyy/kube-symbiont/internal/metrics"
@@ -582,9 +584,20 @@ func pollInterval(sw *symbiontv1alpha1.ShadowWorkload) time.Duration {
 	return d
 }
 
+// primaryShadowWorkloadPredicate accepts create/delete events and spec changes,
+// but filters status-only updates. Reconcile writes a fresh measurement timestamp
+// to status on successful polls; allowing that status update to enqueue the same
+// object immediately creates a self-triggering PATCH/reconcile loop that defeats
+// spec.update.pollInterval.
+func primaryShadowWorkloadPredicate() predicate.Predicate {
+	return predicate.GenerationChangedPredicate{}
+}
+
 // SetupWithManager sets up the controller with the Manager. Owning phantom
 // pods means external deletion or modification triggers an immediate
 // reconcile; the poll clock keeps the metric-driven cadence regardless.
+// Status-only ShadowWorkload updates are deliberately filtered so the
+// controller's own status write cannot bypass that poll clock.
 func (r *ShadowWorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		// GetEventRecorder returns the newer events recorder, which does not
@@ -608,7 +621,10 @@ func (r *ShadowWorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("register shadow workload metrics: %w", err)
 	}
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&symbiontv1alpha1.ShadowWorkload{}).
+		For(
+			&symbiontv1alpha1.ShadowWorkload{},
+			builder.WithPredicates(primaryShadowWorkloadPredicate()),
+		).
 		Owns(&corev1.Pod{}).
 		Named("shadowworkload").
 		Complete(r)

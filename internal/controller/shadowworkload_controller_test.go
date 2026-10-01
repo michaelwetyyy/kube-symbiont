@@ -39,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -177,6 +178,23 @@ func validShadowWorkload(name string) *symbiontv1alpha1.ShadowWorkload {
 		},
 	}
 }
+
+var _ = Describe("ShadowWorkload primary event predicate", func() {
+	It("ignores status-only updates but accepts spec-generation changes", func() {
+		p := primaryShadowWorkloadPredicate()
+		old := validShadowWorkload("predicate-shadow")
+		old.Generation = 7
+		statusOnly := old.DeepCopy()
+		statusOnly.Status.CurrentCPU = resource.MustParse("250m")
+		statusOnly.Generation = old.Generation
+
+		Expect(p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: statusOnly})).To(BeFalse())
+
+		specChanged := statusOnly.DeepCopy()
+		specChanged.Generation = old.Generation + 1
+		Expect(p.Update(event.UpdateEvent{ObjectOld: statusOnly, ObjectNew: specChanged})).To(BeTrue())
+	})
+})
 
 var _ = Describe("ShadowWorkload Controller", func() {
 	const resourceName = "test-shadow"
