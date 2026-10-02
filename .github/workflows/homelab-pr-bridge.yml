@@ -19,6 +19,7 @@ jobs:
       contents: read
     outputs:
       merge_requested: ${{ steps.meta.outputs.merge_requested }}
+      candidate_tag: ${{ steps.meta.outputs.candidate_tag }}
     steps:
       - name: Clone the exact branch source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -43,6 +44,12 @@ jobs:
           else
             echo 'merge_requested=false' >> "$GITHUB_OUTPUT"
           fi
+          candidate_tag="$(sed -n 's/^Automation-Candidate:[[:space:]]*//p' <<<"$body" | tail -n 1)"
+          if [[ -n "$candidate_tag" ]]; then
+            [[ "$candidate_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]
+            python3 -B hack/verify_release.py --kind candidate --tag "$candidate_tag"
+          fi
+          echo "candidate_tag=$candidate_tag" >> "$GITHUB_OUTPUT"
 
       - name: Run repository gates
         shell: bash
@@ -65,7 +72,7 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     permissions:
-      actions: read
+      actions: write
       contents: write
       pull-requests: write
     env:
@@ -159,6 +166,7 @@ jobs:
 
       - name: Merge the validated PR
         if: needs.gate.outputs.merge_requested == 'true'
+        id: merge
         env:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           EXPECTED_TREE: ${{ steps.merge_tree.outputs.tree }}
@@ -173,4 +181,19 @@ jobs:
           test "$(git rev-parse refs/remotes/origin/main)" = "$merge_sha"
           test "$(git rev-parse "$merge_sha^{tree}")" = "$EXPECTED_TREE"
           git merge-base --is-ancestor "$GITHUB_SHA" "$merge_sha"
+          echo "merge_sha=$merge_sha" >> "$GITHUB_OUTPUT"
           echo "Merged PR #$PR_NUMBER as $merge_sha with the exact validated tree."
+
+      - name: Dispatch candidate publication
+        if: needs.gate.outputs.merge_requested == 'true' && needs.gate.outputs.candidate_tag != ''
+        env:
+          CANDIDATE_TAG: ${{ needs.gate.outputs.candidate_tag }}
+          EXPECTED_SHA: ${{ steps.merge.outputs.merge_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_SHA"
+          gh workflow run candidate.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f image_tag="$CANDIDATE_TAG" \
+            -f expected_sha="$EXPECTED_SHA"
+          echo "Dispatched candidate $CANDIDATE_TAG for exact main $EXPECTED_SHA."
